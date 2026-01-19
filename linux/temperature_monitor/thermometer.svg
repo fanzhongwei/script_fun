@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- 温度计主体 -->
+  <rect x="28" y="8" width="8" height="40" rx="4" fill="#4A90E2" stroke="#2E5C8A" stroke-width="1"/>
+  
+  <!-- 温度计底部（圆形） -->
+  <circle cx="32" cy="52" r="8" fill="#E74C3C" stroke="#C0392B" stroke-width="1"/>
+  
+  <!-- 温度计内部液体（根据温度显示） -->
+  <rect x="30" y="32" width="4" height="16" rx="2" fill="#E74C3C"/>
+  
+  <!-- 温度刻度线 -->
+  <line x1="38" y1="12" x2="40" y2="12" stroke="#2E5C8A" stroke-width="1"/>
+  <line x1="38" y1="20" x2="40" y2="20" stroke="#2E5C8A" stroke-width="1"/>
+  <line x1="38" y1="28" x2="40" y2="28" stroke="#2E5C3C" stroke-width="1.5"/>
+  <line x1="38" y1="36" x2="40" y2="36" stroke="#E74C3C" stroke-width="2"/>
+  <line x1="38" y1="44" x2="40" y2="44" stroke="#E74C3C" stroke-width="2"/>
+  
+  <!-- 温度计顶部小圆 -->
+  <circle cx="32" cy="8" r="3" fill="#4A90E2" stroke="#2E5C8A" stroke-width="1"/>
+</svg>
+

@@ -1,3 +1,4 @@
 # AI Log Plugin 推荐忽略项
 .specstory/
 .ailog/
+.cursorindexingignore
