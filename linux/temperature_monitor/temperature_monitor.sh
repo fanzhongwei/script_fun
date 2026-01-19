@@ -966,6 +966,45 @@ check_temperature() {
 run_background() {
     local pid_file="/tmp/temperature_monitor_${DEVICE:-default}.pid"
     local config_file=$(get_config_file)
+    local script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    
+    # 使用进程列表检查是否已有后台实例在运行（优先于 PID 文件，避免竞争条件）
+    # 仅当系统存在 pgrep 时启用此检查
+    if command -v pgrep >/dev/null 2>&1; then
+        # 匹配带有 -b 参数的脚本实例，排除当前进程自身
+        local running_pids
+        running_pids=$(pgrep -f "${script_path}.*-b" || true)
+        if [[ -n "$running_pids" ]]; then
+            local pid
+            for pid in $running_pids; do
+                if [[ "$pid" != "$$" ]]; then
+                    echo "提示: 温度监控脚本已在后台运行 (PID: $pid)" >&2
+                    echo "如需重新启动，请先停止当前后台进程后再重试。" >&2
+                    return 0
+                fi
+            done
+        fi
+    fi
+    
+    # 全局检查是否已有后台运行的温度监控脚本
+    # 如果任意一个有效的 PID 文件对应的进程仍在运行，则认为脚本已在后台运行，直接退出
+    if compgen -G "/tmp/temperature_monitor_*.pid" > /dev/null 2>&1; then
+        local existing_pid_file
+        for existing_pid_file in /tmp/temperature_monitor_*.pid; do
+            [[ ! -f "$existing_pid_file" ]] && continue
+            local old_pid=""
+            old_pid=$(cat "$existing_pid_file" 2>/dev/null || echo "")
+            [[ -z "$old_pid" ]] && continue
+            if kill -0 "$old_pid" 2>/dev/null; then
+                echo "提示: 温度监控脚本已在后台运行 (PID: $old_pid)" >&2
+                echo "如需重新启动，请先停止当前后台进程后再重试。" >&2
+                return 0
+            else
+                # 清理失效的 PID 文件
+                rm -f "$existing_pid_file" 2>/dev/null || true
+            fi
+        done
+    fi
     
     # 检查是否已经在运行
     if [[ -f "$pid_file" ]]; then
