@@ -964,98 +964,84 @@ check_temperature() {
 
 # 后台运行模式
 run_background() {
-    local pid_file="/tmp/temperature_monitor_${DEVICE:-default}.pid"
-    local config_file=$(get_config_file)
-    local script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    
-    # 使用进程列表检查是否已有后台实例在运行（优先于 PID 文件，避免竞争条件）
-    # 仅当系统存在 pgrep 时启用此检查
-    if command -v pgrep >/dev/null 2>&1; then
-        # 匹配带有 -b 参数的脚本实例，排除当前进程自身
-        local running_pids
-        running_pids=$(pgrep -f "${script_path}.*-b" || true)
-        if [[ -n "$running_pids" ]]; then
-            local pid
-            for pid in $running_pids; do
-                if [[ "$pid" != "$$" ]]; then
-                    echo "提示: 温度监控脚本已在后台运行 (PID: $pid)" >&2
-                    echo "如需重新启动，请先停止当前后台进程后再重试。" >&2
-                    return 0
-                fi
-            done
+    local config_file
+    config_file=$(get_config_file)
+    local lock_dir="/tmp/temperature_monitor_background.lock"
+    local lock_pid_file="${lock_dir}/pid"
+
+    # 在父进程中先尝试获取全局锁，只有真正抢到锁才启动后台子进程
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        # 锁目录已存在，读取其中记录的 PID 检查是否为“脏锁”
+        local existing_pid=""
+        if [[ -f "$lock_pid_file" ]]; then
+            existing_pid=$(cat "$lock_pid_file" 2>/dev/null || echo "")
         fi
-    fi
-    
-    # 全局检查是否已有后台运行的温度监控脚本
-    # 如果任意一个有效的 PID 文件对应的进程仍在运行，则认为脚本已在后台运行，直接退出
-    if compgen -G "/tmp/temperature_monitor_*.pid" > /dev/null 2>&1; then
-        local existing_pid_file
-        for existing_pid_file in /tmp/temperature_monitor_*.pid; do
-            [[ ! -f "$existing_pid_file" ]] && continue
-            local old_pid=""
-            old_pid=$(cat "$existing_pid_file" 2>/dev/null || echo "")
-            [[ -z "$old_pid" ]] && continue
-            if kill -0 "$old_pid" 2>/dev/null; then
-                echo "提示: 温度监控脚本已在后台运行 (PID: $old_pid)" >&2
+
+        # 只有当 PID 存在且命令行中确实包含 temperature_monitor.sh -b 时，才认为已有实例
+        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+            if ps -p "$existing_pid" -o cmd= 2>/dev/null | grep -q "temperature_monitor.sh" && \
+               ps -p "$existing_pid" -o cmd= 2>/dev/null | grep -q -- " -b"; then
+                echo "提示: 温度监控脚本已在后台运行 (PID: $existing_pid)" >&2
                 echo "如需重新启动，请先停止当前后台进程后再重试。" >&2
                 return 0
-            else
-                # 清理失效的 PID 文件
-                rm -f "$existing_pid_file" 2>/dev/null || true
             fi
-        done
-    fi
-    
-    # 检查是否已经在运行
-    if [[ -f "$pid_file" ]]; then
-        local old_pid=$(cat "$pid_file")
-        if kill -0 "$old_pid" 2>/dev/null; then
-            echo "错误: 监控进程已在运行 (PID: $old_pid)" >&2
-            exit 1
-        else
-            rm -f "$pid_file"
+        fi
+
+        # 走到这里说明 PID 对应进程已不存在或不是我们的后台实例，视为“脏锁”
+        rm -rf "$lock_dir" 2>/dev/null || true
+
+        # 尝试重新获取锁，如果仍失败则认为确有其它实例在运行（极小概率竞争）
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            echo "提示: 温度监控脚本已在后台运行" >&2
+            echo "如需重新启动，请先停止当前后台进程后再重试。" >&2
+            return 0
         fi
     fi
-    
-    # 启动后台进程
+
+    # 启动后台进程（此时已经确认抢到锁）
     (
-        echo $$ > "$pid_file"
-        trap "rm -f $pid_file; exit" INT TERM EXIT
-        
+        # 确保退出时删除锁目录和 PID 文件
+        trap "rm -f '$lock_pid_file' 2>/dev/null || true; rmdir '$lock_dir' 2>/dev/null || true; exit" INT TERM EXIT
+
         # 获取初始配置
         local current_interval="${INTERVAL}"
         if [[ -f "$config_file" ]]; then
-            local config_interval=$(read_global_config "$config_file" "interval" "${DEFAULT_INTERVAL}")
+            local config_interval
+            config_interval=$(read_global_config "$config_file" "interval" "${DEFAULT_INTERVAL}")
             if [[ -n "$config_interval" ]] && [[ "$config_interval" =~ ^[0-9]+$ ]]; then
                 current_interval="$config_interval"
             fi
         fi
-        
+
         echo "温度监控已启动 (PID: $$)"
         echo "设备: ${DEVICE:-自动检测（配置文件模式）}"
         echo "阈值: ${THRESHOLD:-配置文件}"
         echo "间隔: ${current_interval}秒（从配置文件读取）"
         echo "日志: 查看系统日志或使用 journalctl -f"
         echo "提示: 修改配置文件后，间隔会在下次循环时自动更新"
-        
+
         while true; do
             # 每次循环前重新读取配置文件中的interval
             if [[ -f "$config_file" ]]; then
-                local config_interval=$(read_global_config "$config_file" "interval" "${DEFAULT_INTERVAL}")
+                local config_interval
+                config_interval=$(read_global_config "$config_file" "interval" "${DEFAULT_INTERVAL}")
                 if [[ -n "$config_interval" ]] && [[ "$config_interval" =~ ^[0-9]+$ ]]; then
                     current_interval="$config_interval"
                 fi
             fi
-            
+
             # 执行温度检测（忽略返回值，确保循环继续）
             # 使用 || true 防止 set -e 导致脚本退出
             check_temperature || true
-            
+
             sleep "$current_interval"
         done
     ) &
-    
-    echo "后台进程 PID: $!"
+
+    # 在父进程中记录真正的后台进程 PID，供下次启动时校验
+    local bg_pid="$!"
+    echo "$bg_pid" > "$lock_pid_file" 2>/dev/null || true
+    echo "后台进程 PID: $bg_pid"
 }
 
 # 主逻辑
