@@ -27,6 +27,7 @@ script_fun/
 - 其他实用脚本
 
 ### Tampermonkey 脚本
+- [image_exporter](tampermonkey/image_exporter/) — 页面图片导出器：发现 img/CSS 背景图，复选批量下载
 - 网页增强脚本
 - 自动化操作脚本
 - 其他浏览器扩展脚本
