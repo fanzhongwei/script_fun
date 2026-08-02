@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.1.1
-// @description  发现页面 img 与 CSS 背景图，按模块分类展示，复选后批量下载到指定子文件夹
+// @version      1.2.1
+// @description  发现页面 img 与 CSS 背景图，按模块分类展示，复选后批量下载到指定子文件夹，支持鼠标划选
 // @author       script_fun
 // @match        *://*/*
 // @grant        GM_download
@@ -21,9 +21,11 @@
   const INVALID_PATH_CHARS = /[\\/:*?"<>|]/g;
   const URL_IN_CSS = /url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi;
   const GRADIENT_PREFIX = /^(linear|radial|conic|repeating-linear|repeating-radial)-gradient/i;
+  const PAINT_THRESHOLD = 4;
 
   /** @type {{ url: string, selected: boolean, moduleKey: string, moduleLabel: string, order: number }[]} */
   let images = [];
+  let suppressCardClick = false;
 
   function sanitizePathPart(name, fallback) {
     const cleaned = String(name || '')
@@ -183,6 +185,122 @@
     return map;
   }
 
+  function findItemByUrl(url) {
+    return images.find((item) => item.url === url) || null;
+  }
+
+  function syncCardSelectionState(card, item) {
+    card.classList.toggle('selected', item.selected);
+    const checkbox = card.querySelector('input[type=checkbox]');
+    if (checkbox) checkbox.checked = item.selected;
+  }
+
+  function updateSelectionBadges(container) {
+    if (!container) return;
+    const orderMap = getSelectionOrderMap();
+    container.querySelectorAll('.pie-item').forEach((card) => {
+      const url = card.getAttribute('data-pie-url');
+      if (!url) return;
+      const item = findItemByUrl(url);
+      if (!item) return;
+      let badge = card.querySelector('.pie-order-badge');
+      const order = orderMap.get(item);
+      if (item.selected && order) {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'pie-order-badge';
+          card.appendChild(badge);
+        }
+        badge.textContent = String(order);
+      } else if (badge) {
+        badge.remove();
+      }
+    });
+  }
+
+  function toggleCardAtPoint(clientX, clientY, visitedUrls, sectionGrid, grid) {
+    const el = document.elementFromPoint(clientX, clientY);
+    const card = el && el.closest ? el.closest('.pie-item') : null;
+    if (!card || !sectionGrid.contains(card)) return;
+    const url = card.getAttribute('data-pie-url');
+    if (!url || visitedUrls.has(url)) return;
+    visitedUrls.add(url);
+    const item = findItemByUrl(url);
+    if (!item) return;
+    item.selected = !item.selected;
+    syncCardSelectionState(card, item);
+    updateSelectionBadges(grid);
+  }
+
+  function makePaintSelection(grid) {
+    let startX = 0;
+    let startY = 0;
+    let painting = false;
+    let visitedUrls = new Set();
+    let active = false;
+    let startSectionGrid = null;
+
+    const cleanup = () => {
+      active = false;
+      painting = false;
+      visitedUrls = new Set();
+      if (startSectionGrid) {
+        startSectionGrid.classList.remove('painting');
+        startSectionGrid = null;
+      }
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onEnd);
+      document.removeEventListener('selectstart', onSelectStart);
+    };
+
+    const onSelectStart = (e) => {
+      if (painting) e.preventDefault();
+    };
+
+    const onMove = (e) => {
+      if (!active) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (!painting && (Math.abs(dx) > PAINT_THRESHOLD || Math.abs(dy) > PAINT_THRESHOLD)) {
+        painting = true;
+        if (startSectionGrid) startSectionGrid.classList.add('painting');
+      }
+      if (painting) {
+        e.preventDefault();
+        toggleCardAtPoint(e.clientX, e.clientY, visitedUrls, startSectionGrid, grid);
+      }
+    };
+
+    const onEnd = () => {
+      if (painting) suppressCardClick = true;
+      cleanup();
+    };
+
+    grid.addEventListener('dragstart', (e) => {
+      e.preventDefault();
+    }, true);
+
+    grid.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      const tag = e.target.tagName;
+      if (tag === 'INPUT' || tag === 'BUTTON') return;
+      const card = e.target.closest('.pie-item');
+      if (!card) return;
+      const sectionGrid = card.closest('.pie-section-grid');
+      if (!sectionGrid) return;
+      e.preventDefault();
+      active = true;
+      painting = false;
+      visitedUrls = new Set();
+      startSectionGrid = sectionGrid;
+      startX = e.clientX;
+      startY = e.clientY;
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onEnd);
+      document.addEventListener('selectstart', onSelectStart);
+    });
+  }
+
   function guessExtension(url) {
     if (url.startsWith('data:')) {
       const m = url.match(/^data:image\/([a-zA-Z0-9+.-]+)/);
@@ -210,9 +328,12 @@
   }
 
   function injectStyles() {
-    if (document.getElementById('pie-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'pie-styles';
+    let style = document.getElementById('pie-styles');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'pie-styles';
+      document.documentElement.appendChild(style);
+    }
     style.textContent = `
       #${ROOT_ID} * { box-sizing: border-box; }
       #${ROOT_ID} .pie-fab {
@@ -248,6 +369,8 @@
       #${ROOT_ID} .pie-grid {
         padding: 12px 16px 16px; overflow: auto;
       }
+      #${ROOT_ID} .pie-section-grid.painting { user-select: none; }
+      #${ROOT_ID} .pie-section-grid.painting .pie-item { cursor: crosshair; }
       #${ROOT_ID} .pie-section { margin-bottom: 16px; }
       #${ROOT_ID} .pie-section-header {
         display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -273,6 +396,7 @@
       #${ROOT_ID} .pie-item.selected { border-color: #2563eb; }
       #${ROOT_ID} .pie-item img {
         width: 100%; height: 100%; object-fit: contain; display: block; background: #f3f4f6;
+        -webkit-user-drag: none; user-drag: none; pointer-events: none;
       }
       #${ROOT_ID} .pie-item input[type=checkbox] {
         position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; cursor: pointer; z-index: 1;
@@ -284,7 +408,6 @@
       }
       #${ROOT_ID} .pie-empty { padding: 24px; text-align: center; color: #6b7280; }
     `;
-    document.documentElement.appendChild(style);
   }
 
   function ensureRoot() {
@@ -306,6 +429,7 @@
   function createImageCard(item, selectionOrder) {
     const card = document.createElement('div');
     card.className = `pie-item${item.selected ? ' selected' : ''}`;
+    card.setAttribute('data-pie-url', item.url);
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
@@ -324,7 +448,9 @@
     const img = document.createElement('img');
     img.alt = 'preview';
     img.loading = 'lazy';
+    img.draggable = false;
     img.src = item.url;
+    img.addEventListener('dragstart', (e) => e.preventDefault());
     img.addEventListener('error', () => {
       img.style.opacity = '0.35';
     });
@@ -342,6 +468,11 @@
 
     card.addEventListener('click', (e) => {
       if (e.target === checkbox) return;
+      if (suppressCardClick) {
+        suppressCardClick = false;
+        e.preventDefault();
+        return;
+      }
       item.selected = !item.selected;
       refresh();
     });
@@ -464,6 +595,7 @@
     const grid = document.createElement('div');
     grid.className = 'pie-grid';
     renderGrid(grid);
+    makePaintSelection(grid);
 
     downloadBtn.addEventListener('click', () => {
       const folder = sanitizePathPart(folderInput.value.trim(), '');
