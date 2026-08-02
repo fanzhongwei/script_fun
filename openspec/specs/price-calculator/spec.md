@@ -19,7 +19,11 @@ TBD - created by archiving change add-tampermonkey-price-calculator. Update Purp
 
 ### Requirement: 扫描页面 SKU 表格
 
-脚本 SHALL 在当前页面查找包含「款式」与「拼单价」列头的 SKU 表格，提取每行的款式名称，以及「拼单价(元)」「单买价(元)」列中的输入框 DOM 引用，用于后续回填。
+脚本 SHALL 在当前页面查找包含至少一列规格属性（如款式、颜色、尺寸、型号等）与「拼单价」列头的 SKU 表格，提取每行数据用于计算与回填：
+
+- **款式**：取「当前库存」列的前一列（即最后一个规格列）的文本；若表头无「当前库存」列，则取最后一个匹配规格表头的列。当 body 行因 rowspan 合并导致 td 数少于表头时，SHALL 按 `offset = 表头列数 - 当前行 td 数` 补偿列索引后再取对应 cell
+- **拼单价 / 单买价输入框**：优先按行内 DOM 顺序定位——第一个 `.sku-beast-price-input-container input` 为拼单价，第二个为单买价；若行内不足两个 price input，则 fallback 到 offset 补偿后的表头列索引
+- **成本初始值**：若拼单价输入框当前值 > 0，SHALL 作为该行成本（含人工）的初始值
 
 #### Scenario: 成功扫描 SKU 行
 
@@ -30,6 +34,17 @@ TBD - created by archiving change add-tampermonkey-price-calculator. Update Purp
 
 - **WHEN** 页面不存在符合条件的 SKU 表格
 - **THEN** 弹窗展示空状态提示，并说明未找到可识别的规格表格
+
+#### Scenario: 多规格 rowspan 表格正确初始化
+
+- **WHEN** SKU 表格包含多个规格列（如「型号」与「尺寸」），且第一个规格列使用 rowspan 合并
+- **THEN** 每行款式文本取自「当前库存」前一列（最后一个规格列，如「尺寸」），而非第一个规格列（如「型号」）
+- **AND** 每行成本初始值取自该行拼单价输入框的当前值（> 0 时填入）
+
+#### Scenario: 单规格表格行为不变
+
+- **WHEN** SKU 表格仅有一列规格属性且无 rowspan 错位
+- **THEN** 扫描结果与修复前一致：款式取自该规格列，成本取自拼单价输入框当前值
 
 ### Requirement: 弹窗尺寸与列布局
 
