@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.3.1
+// @version      1.3.2
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加与一键回填
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -216,22 +216,20 @@
     return STYLE_HEADER_NAMES.has(text);
   }
 
-  function extractStyleFromCells(cells, styleCols) {
-    const titleCell = styleCols.map((i) => cells[i]).find((c) => c?.querySelector('.sku-row-title'));
-    if (titleCell) {
-      const title = titleCell.querySelector('.sku-row-title');
-      if (title) return (title.textContent || '').replace(/\s+/g, ' ').trim();
-    }
-    const parts = styleCols
-      .map((i) => (cells[i]?.textContent || '').replace(/\s+/g, ' ').trim())
-      .filter(Boolean);
-    return parts.join('_');
-  }
-
   function extractStyleFromCell(cell) {
     const title = cell.querySelector('.sku-row-title');
     if (title) return (title.textContent || '').replace(/\s+/g, ' ').trim();
     return (cell.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getRowColumnOffset(headerCellCount, rowCellCount) {
+    return Math.max(0, headerCellCount - rowCellCount);
+  }
+
+  function getCellAt(cells, headerIndex, offset) {
+    const index = headerIndex - offset;
+    if (index < 0 || index >= cells.length) return null;
+    return cells[index];
   }
 
   function detectHeaderColumns(cells) {
@@ -240,15 +238,35 @@
       if (isStyleHeader(t)) acc.push(i);
       return acc;
     }, []);
+    const inventoryCol = texts.findIndex((t) => t.includes('当前库存'));
     const groupCol = texts.findIndex((t) => t.includes('拼单价'));
     const singleCol = texts.findIndex((t) => t.includes('单买价'));
     if (styleCols.length === 0 || groupCol < 0) return null;
+    const styleCol = inventoryCol > 0
+      ? inventoryCol - 1
+      : styleCols[styleCols.length - 1];
     return {
       styleCols,
-      styleCol: styleCols[0],
+      styleCol,
       groupCol,
       singleCol: singleCol >= 0 ? singleCol : groupCol + 1,
+      headerCellCount: cells.length,
     };
+  }
+
+  function findPriceInputsInRow(row, cells, cols, offset) {
+    const priceInputs = row.querySelectorAll('.sku-beast-price-input-container input');
+    let groupInput = priceInputs[0] || null;
+    let singleInput = priceInputs[1] || null;
+    if (!groupInput) {
+      const groupCell = getCellAt(cells, cols.groupCol, offset);
+      groupInput = groupCell ? findPriceInputInCell(groupCell) : null;
+    }
+    if (!singleInput && cols.singleCol >= 0) {
+      const singleCell = getCellAt(cells, cols.singleCol, offset);
+      singleInput = singleCell ? findPriceInputInCell(singleCell) : null;
+    }
+    return { groupInput, singleInput };
   }
 
   function buildSkuRow(style, groupInput, singleInput, rowIndex) {
@@ -275,14 +293,10 @@
     const result = [];
     bodyRows.forEach((row) => {
       const cells = getRowCells(row);
-      const maxCol = Math.max(...cols.styleCols, cols.groupCol, cols.singleCol);
-      if (cells.length <= maxCol) return;
-
-      const style = cols.styleCols.length > 1
-        ? extractStyleFromCells(cells, cols.styleCols)
-        : extractStyleFromCell(cells[cols.styleCol]);
-      const groupInput = findPriceInputInCell(cells[cols.groupCol]);
-      const singleInput = cols.singleCol >= 0 ? findPriceInputInCell(cells[cols.singleCol]) : null;
+      const offset = getRowColumnOffset(cols.headerCellCount, cells.length);
+      const styleCell = getCellAt(cells, cols.styleCol, offset);
+      const style = styleCell ? extractStyleFromCell(styleCell) : '';
+      const { groupInput, singleInput } = findPriceInputsInRow(row, cells, cols, offset);
       if (!style || !groupInput) return;
 
       result.push(buildSkuRow(style, groupInput, singleInput, result.length));
