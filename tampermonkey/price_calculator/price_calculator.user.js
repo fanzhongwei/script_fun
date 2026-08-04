@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.3.2
-// @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加与一键回填
+// @version      1.4.2
+// @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
 // @grant        GM_setValue
@@ -16,8 +16,8 @@
   const ROOT_ID = 'pc-root';
   const FAB_POS_KEY = 'pc_fab_pos';
   const PASTE_SPLIT = /[\s,;，；\t\n\r]+/;
+  const EXPORT_VERSION = 'v1';
 
-  /** 拼多多 SKU 表第一规格列常见表头（语义匹配，非固定「款式/尺寸」） */
   const STYLE_HEADER_NAMES = new Set([
     '款式', '颜色', '尺寸', '型号', '器型', '材质', '口味', '色号', '适用人群',
     '容量', '花型', '尺码', '地点', '包装方式', '香型', '货号', '组合', '成份',
@@ -32,25 +32,28 @@
     platformFee: 0.6,
   };
 
-  /** @type {{ style: string, groupInput: HTMLInputElement, singleInput: HTMLInputElement, rowIndex: number, cost: string, freight: number, returnRate: number, targetMargin: number, platformFee: number, singleRandomOffset: number, groupPrice: number|null, singlePrice: number|null, marginRate: number|null }[]} */
+  const IMPORT_FIELD_MAP = {
+    款式: 'style',
+    采购成本: 'cost',
+    运费: 'freight',
+    退货率: 'returnRate',
+    平台扣点: 'platformFee',
+    目标利润率: 'targetMargin',
+  };
+
+  /** @type {SkuRow[]} */
   let rows = [];
 
-  /** @type {{ reorder: ActivityItem, follow: ActivityItem, newCustomer: ActivityItem, live: ActivityItem, scene: ActivityItem, timeLimit: TimeLimitItem }} */
+  /** @type {{ coupon: { amount: number }, timeLimit: { type: '立减'|'打折', value: number } }} */
   let globalActivities = createDefaultActivities();
 
-  /** 批量粘贴成本时抑制 input 回调，避免重绘后空 input 事件清空首行 */
   let suppressCostInput = false;
 
-  /** @typedef {{ amount: number }} ActivityItem */
-  /** @typedef {{ type: '立减'|'打折', value: number }} TimeLimitItem */
+  /** @typedef {{ style: string, groupInput: HTMLInputElement, singleInput: HTMLInputElement, rowIndex: number, cost: string, freight: number, returnRate: number, targetMargin: number, platformFee: number, singleRandomOffset: number, actualCost: number|null, actualGroupPrice: number|null, groupPrice: number|null, singlePrice: number|null, actualProfit: number|null, marginRate: number|null, netBreakEvenRoi: number|null, microPaidRoi: number|null, optimalRoi: number|null }} SkuRow */
 
   function createDefaultActivities() {
     return {
-      reorder: { amount: 0 },
-      follow: { amount: 0 },
-      newCustomer: { amount: 0 },
-      live: { amount: 0 },
-      scene: { amount: 0 },
+      coupon: { amount: 0 },
       timeLimit: { type: '立减', value: 0 },
     };
   }
@@ -77,83 +80,31 @@
     return round2(3 + Math.random() * 2);
   }
 
-  /**
-   * 单买价 = 基础拼单价 K × 1.1 + 优惠券金额 + 限时加价 + [3~5] 随机小数
-   * 优惠券/限时加价部分不乘 1.1（限时加价 = 最终拼单价 - 互斥活动后拼单价，含立减/打折）
-   */
-  function calcSinglePrice(K, couponAmount, timeLimitAdd, offset) {
-    return round2(K * 1.1 + couponAmount + timeLimitAdd + offset);
-  }
-
-  function calcBase(C, E, G, I, J) {
-    const denom = (1 - I) - J / (1 - G);
-    if (!(C > 0) || denom <= 0 || !Number.isFinite(denom)) return null;
-    const N = (C + E) / denom;
-    const K = round2(N);
-    return { K, N };
-  }
-
-  /** 前五项均为「立减 a 元」类优惠券，拼单价补偿 K+a */
-  function calcExclusiveCandidate(key, K, amount) {
-    const a = Math.max(0, amount || 0);
-    const pin = round2(K + a);
-    return { pin, key };
-  }
-
-  const EXCLUSIVE_ACTIVITY_KEYS = ['reorder', 'follow', 'newCustomer', 'live', 'scene'];
-
-  /**
-   * 前五项互斥活动：取金额最高的一项，再按其类型公式计算（同额时按列表优先级）
-   * 限时限量购在结果上叠加，见 applyTimeLimit
-   */
-  function pickExclusiveResult(K, activities) {
-    let pickedKey = null;
-    let pickedAmount = 0;
-    EXCLUSIVE_ACTIVITY_KEYS.forEach((key) => {
-      const a = Math.max(0, activities[key]?.amount || 0);
-      if (a > pickedAmount) {
-        pickedAmount = a;
-        pickedKey = key;
-      }
-    });
-    if (!pickedKey || pickedAmount <= 0) {
-      return { pin: K, key: 'base', couponAmount: 0 };
-    }
-    const result = calcExclusiveCandidate(pickedKey, K, pickedAmount);
-    return { ...result, couponAmount: pickedAmount };
+  function calcSinglePrice(basePrice, couponAmount, timeLimitAdd, offset) {
+    return round2(basePrice * 1.1 + couponAmount + timeLimitAdd + offset);
   }
 
   function applyTimeLimit(pin0, timeLimit) {
-    if (!timeLimit || !(timeLimit.value > 0)) {
-      return pin0;
-    }
+    if (!timeLimit || !(timeLimit.value > 0)) return pin0;
     const v = Math.max(0, timeLimit.value || 0);
-    if (timeLimit.type === '立减') {
-      return round2(pin0 + v);
-    }
-    // 打折：v 为折后支付比例（六折 = 60，即顾客付挂牌价 60%）
+    if (timeLimit.type === '立减') return round2(pin0 + v);
     const payRate = clampPercent(v) / 100;
     if (payRate <= 0) return pin0;
     return round2(pin0 / payRate);
   }
 
-  /** 顾客实付净价：用于回算实际利润率 */
-  function customerNetPrice(finalPin, pickedKey, activities, timeLimit) {
-    const tl = timeLimit;
-    const hasTimeLimit = tl && (tl.value || 0) > 0;
-
-    if (hasTimeLimit) {
-      if (tl.type === '立减') {
-        return Math.max(0, finalPin - Math.max(0, tl.value || 0));
-      }
-      const payRate = clampPercent(tl.value) / 100;
-      return payRate > 0 ? Math.max(0, finalPin * payRate) : 0;
-    }
-
-    if (pickedKey && pickedKey !== 'base') {
-      return Math.max(0, finalPin - Math.max(0, activities[pickedKey]?.amount || 0));
-    }
-    return Math.max(0, finalPin);
+  function emptyCalcResult() {
+    return {
+      actualCost: null,
+      actualGroupPrice: null,
+      groupPrice: null,
+      singlePrice: null,
+      actualProfit: null,
+      marginRate: null,
+      netBreakEvenRoi: null,
+      microPaidRoi: null,
+      optimalRoi: null,
+    };
   }
 
   function calcRow(row, activities) {
@@ -163,35 +114,75 @@
     const I = pctToDecimal(row.platformFee);
     const J = pctToDecimal(row.targetMargin);
 
-    if (!(C > 0) || !Number.isFinite(E) || E < 0) {
-      return { groupPrice: null, singlePrice: null, marginRate: null };
+    if (!(C > 0) || !Number.isFinite(E) || E < 0) return emptyCalcResult();
+
+    const actualCost = round2(C + E);
+    const actualGroupPrice = round2(actualCost * (1 + J));
+
+    const couponAmount = Math.max(0, activities.coupon?.amount || 0);
+    const pin0 = round2(actualGroupPrice + couponAmount);
+    const groupPrice = applyTimeLimit(pin0, activities.timeLimit);
+    const timeLimitAdd = round2(Math.max(0, groupPrice - pin0));
+    const singlePrice = calcSinglePrice(
+      actualGroupPrice,
+      couponAmount,
+      timeLimitAdd,
+      row.singleRandomOffset,
+    );
+
+    const actualProfit = round2(actualGroupPrice * (1 - I) - C - E);
+
+    let marginRate = null;
+    let netBreakEvenRoi = null;
+    let microPaidRoi = null;
+    let optimalRoi = null;
+
+    if (actualGroupPrice > 0) {
+      marginRate = round2((actualProfit / actualGroupPrice) * 100);
     }
 
-    const base = calcBase(C, E, G, I, J);
-    if (!base) return { groupPrice: null, singlePrice: null, marginRate: null };
-
-    const { K } = base;
-    const picked = pickExclusiveResult(K, activities);
-    const finalPin = applyTimeLimit(picked.pin, activities.timeLimit);
-    const timeLimitAdd = round2(Math.max(0, finalPin - picked.pin));
-    const single = calcSinglePrice(K, picked.couponAmount, timeLimitAdd, row.singleRandomOffset);
-
-    const net = customerNetPrice(finalPin, picked.key, activities, activities.timeLimit);
-    let marginRate = null;
-    if (net > 0) {
-      const F = net * (1 - I) - C - E;
-      marginRate = round2((F / net) * (1 - G) * 100);
+    if (actualProfit > 0 && actualGroupPrice > 0 && G < 1) {
+      netBreakEvenRoi = round2((actualGroupPrice / actualProfit) / (1 - G));
+      microPaidRoi = round2(netBreakEvenRoi / 2 + 0.5);
+      const coef = marginRate != null && marginRate > 50 ? 1.4 : 2;
+      optimalRoi = round2(netBreakEvenRoi * coef);
     }
 
     return {
-      groupPrice: finalPin,
-      singlePrice: single,
+      actualCost,
+      actualGroupPrice,
+      groupPrice,
+      singlePrice,
+      actualProfit,
       marginRate,
+      netBreakEvenRoi,
+      microPaidRoi,
+      optimalRoi,
     };
+  }
+
+  function applyCalcResult(row, r) {
+    row.actualCost = r.actualCost;
+    row.actualGroupPrice = r.actualGroupPrice;
+    row.groupPrice = r.groupPrice;
+    row.singlePrice = r.singlePrice;
+    row.actualProfit = r.actualProfit;
+    row.marginRate = r.marginRate;
+    row.netBreakEvenRoi = r.netBreakEvenRoi;
+    row.microPaidRoi = r.microPaidRoi;
+    row.optimalRoi = r.optimalRoi;
   }
 
   function normalizeHeaderText(text) {
     return String(text || '').replace(/\*/g, '').replace(/\s+/g, '').trim();
+  }
+
+  function normalizeImportHeader(text) {
+    return String(text || '')
+      .replace(/（[^）]*）/g, '')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/\s+/g, '')
+      .trim();
   }
 
   function getRowCells(row) {
@@ -238,20 +229,27 @@
       if (isStyleHeader(t)) acc.push(i);
       return acc;
     }, []);
-    const inventoryCol = texts.findIndex((t) => t.includes('当前库存'));
     const groupCol = texts.findIndex((t) => t.includes('拼单价'));
     const singleCol = texts.findIndex((t) => t.includes('单买价'));
     if (styleCols.length === 0 || groupCol < 0) return null;
-    const styleCol = inventoryCol > 0
-      ? inventoryCol - 1
-      : styleCols[styleCols.length - 1];
     return {
       styleCols,
-      styleCol,
       groupCol,
       singleCol: singleCol >= 0 ? singleCol : groupCol + 1,
       headerCellCount: cells.length,
     };
+  }
+
+  function extractStyleFromRow(cells, styleCols, offset, carry) {
+    const parts = [];
+    styleCols.forEach((colIndex) => {
+      const cell = getCellAt(cells, colIndex, offset);
+      let text = cell ? extractStyleFromCell(cell) : '';
+      if (text) carry[colIndex] = text;
+      else if (carry[colIndex]) text = carry[colIndex];
+      if (text) parts.push(text);
+    });
+    return parts.join(' / ');
   }
 
   function findPriceInputsInRow(row, cells, cols, offset) {
@@ -283,28 +281,32 @@
       targetMargin: DEFAULTS.targetMargin,
       platformFee: DEFAULTS.platformFee,
       singleRandomOffset: randomSingleOffset(),
+      actualCost: null,
+      actualGroupPrice: null,
       groupPrice: null,
       singlePrice: null,
+      actualProfit: null,
       marginRate: null,
+      netBreakEvenRoi: null,
+      microPaidRoi: null,
+      optimalRoi: null,
     };
   }
 
   function extractSkuRowsFromBody(cols, bodyRows) {
+    const carry = {};
     const result = [];
     bodyRows.forEach((row) => {
       const cells = getRowCells(row);
       const offset = getRowColumnOffset(cols.headerCellCount, cells.length);
-      const styleCell = getCellAt(cells, cols.styleCol, offset);
-      const style = styleCell ? extractStyleFromCell(styleCell) : '';
+      const style = extractStyleFromRow(cells, cols.styleCols, offset, carry);
       const { groupInput, singleInput } = findPriceInputsInRow(row, cells, cols, offset);
       if (!style || !groupInput) return;
-
       result.push(buildSkuRow(style, groupInput, singleInput, result.length));
     });
     return result;
   }
 
-  /** 处理 beast-core-table 等「表头 table + 表体 table」分离结构 */
   function scanSkuContainer(container) {
     const headerRow = container.querySelector('[data-testid="beast-core-table-header-tr"]')
       || container.querySelector('thead tr');
@@ -350,7 +352,6 @@
     }
 
     if (headerIndex < 0 || !cols) return [];
-
     return extractSkuRowsFromBody(cols, trs.slice(headerIndex + 1));
   }
 
@@ -378,6 +379,323 @@
     return candidates.reduce((best, cur) => (cur.length > best.length ? cur : best));
   }
 
+  function getGoodsMeta() {
+    let goodsId = 'unknown';
+    try {
+      const url = new URL(window.location.href);
+      for (const key of ['goods_id', 'id', 'goodsId']) {
+        const v = url.searchParams.get(key);
+        if (v) {
+          goodsId = v;
+          break;
+        }
+      }
+      if (goodsId === 'unknown') {
+        const m = url.pathname.match(/(\d{8,})/);
+        if (m) goodsId = m[1];
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const titleInput = document.querySelector('#basic\\.goods_name input[type="text"]');
+    if (goodsId === 'unknown' && titleInput) {
+      const tp = titleInput.getAttribute('data-tracking-params') || '';
+      const m = tp.match(/goods_id_page=(\d+)/);
+      if (m) goodsId = m[1];
+    }
+
+    const goodsTitle = titleInput?.value?.trim() || '未命名商品';
+    return { goodsId, goodsTitle };
+  }
+
+  function sanitizeFilename(name) {
+    return String(name).replace(/[/\\:*?"<>|]/g, '-').slice(0, 80);
+  }
+
+  function formatNum(val) {
+    return val != null && Number.isFinite(val) ? val.toFixed(2) : '—';
+  }
+
+  function formatPct(val) {
+    return val != null && Number.isFinite(val) ? `${val}%` : '—';
+  }
+
+  function escapeMdCell(text) {
+    return String(text ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  }
+
+  function buildExportMarkdown() {
+    const { goodsId, goodsTitle } = getGoodsMeta();
+    const lines = [
+      `# ${goodsId}-${goodsTitle}`,
+      '',
+      `<!-- price-calculator-export ${EXPORT_VERSION} -->`,
+      `<!-- goods_id: ${goodsId} -->`,
+      '',
+      '## 活动配置',
+      '',
+      '| 配置项 | 值 |',
+      '| --- | --- |',
+      `| 立减优惠券（元） | ${globalActivities.coupon.amount} |`,
+      `| 限时限量购类型 | ${globalActivities.timeLimit.type} |`,
+      `| 限时限量购值 | ${globalActivities.timeLimit.value} |`,
+      '',
+      '## SKU 定价',
+      '',
+      '| 款式 | 采购成本（元） | 运费（元） | 退货率（%） | 平台扣点（%） | 目标利润率（%） | 实际成本（元） | 实际利润率（%） | 实际利润（元） | 净保本投产比 | 微付费投产比 | 最佳投产比 | 实际拼单价（元） | 拼单价（元） | 单买价（元） |',
+      '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    ];
+
+    rows.forEach((row) => {
+      lines.push([
+        escapeMdCell(row.style),
+        row.cost || '',
+        row.freight,
+        row.returnRate,
+        row.platformFee,
+        row.targetMargin,
+        formatNum(row.actualCost),
+        formatPct(row.marginRate),
+        formatNum(row.actualProfit),
+        formatNum(row.netBreakEvenRoi),
+        formatNum(row.microPaidRoi),
+        formatNum(row.optimalRoi),
+        formatNum(row.actualGroupPrice),
+        formatNum(row.groupPrice),
+        formatNum(row.singlePrice),
+      ].join(' | ').replace(/^/, '| ').replace(/$/, ' |'));
+    });
+
+    return { markdown: lines.join('\n'), goodsId, goodsTitle };
+  }
+
+  function parseMarkdownTable(sectionText) {
+    const lines = sectionText.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('|'));
+    if (lines.length < 2) return null;
+
+    const splitRow = (line) => line
+      .slice(1, -1)
+      .split('|')
+      .map((c) => c.trim().replace(/\\(.)/g, '$1'));
+
+    const headers = splitRow(lines[0]);
+    const dataRows = [];
+    for (let i = 2; i < lines.length; i += 1) {
+      if (/^[\|\s:-]+$/.test(lines[i])) continue;
+      dataRows.push(splitRow(lines[i]));
+    }
+    return { headers, rows: dataRows };
+  }
+
+  function parseMarkdownExport(text) {
+    const result = {
+      activities: null,
+      skuRows: [],
+    };
+
+    const activityMatch = text.match(/##\s*活动配置\s*\n([\s\S]*?)(?=##\s*SKU|$)/i);
+    if (activityMatch) {
+      const table = parseMarkdownTable(activityMatch[1]);
+      if (table) {
+        const acts = createDefaultActivities();
+        table.rows.forEach((row) => {
+          const key = normalizeImportHeader(row[0]);
+          const val = row[1];
+          if (key.includes('立减优惠券')) acts.coupon.amount = Math.max(0, parseNum(val) || 0);
+          else if (key.includes('限时限量购类型')) acts.timeLimit.type = val === '打折' ? '打折' : '立减';
+          else if (key.includes('限时限量购值')) acts.timeLimit.value = Math.max(0, parseNum(val) || 0);
+        });
+        result.activities = acts;
+      }
+    }
+
+    const skuMatch = text.match(/##\s*SKU\s*定价\s*\n([\s\S]*?)$/i);
+    if (skuMatch) {
+      const table = parseMarkdownTable(skuMatch[1]);
+      if (table) {
+        const headerKeys = table.headers.map((h) => normalizeImportHeader(h));
+        table.rows.forEach((cells) => {
+          const rowData = {};
+          headerKeys.forEach((hk, i) => {
+            const field = IMPORT_FIELD_MAP[hk];
+            if (field && field !== 'style') rowData[field] = cells[i];
+            else if (hk === '款式') rowData.style = cells[i];
+          });
+          if (rowData.style) result.skuRows.push(rowData);
+        });
+      }
+    }
+
+    return result;
+  }
+
+  function applyImportData(parsed) {
+    if (parsed.activities) globalActivities = parsed.activities;
+
+    let matched = 0;
+    let unmatched = 0;
+
+    parsed.skuRows.forEach((importRow) => {
+      const styleKey = String(importRow.style || '').trim();
+      const target = rows.find((r) => r.style.trim() === styleKey);
+      if (!target) {
+        unmatched += 1;
+        return;
+      }
+
+      if (importRow.cost != null && importRow.cost !== '') {
+        const c = parseNum(importRow.cost);
+        target.cost = Number.isFinite(c) && c > 0 ? String(c) : '';
+      }
+      if (importRow.freight != null && importRow.freight !== '') {
+        const v = parseNum(importRow.freight);
+        if (Number.isFinite(v)) target.freight = Math.max(0, v);
+      }
+      if (importRow.returnRate != null && importRow.returnRate !== '') {
+        const v = parseNum(String(importRow.returnRate).replace('%', ''));
+        if (Number.isFinite(v)) target.returnRate = clampPercent(v);
+      }
+      if (importRow.platformFee != null && importRow.platformFee !== '') {
+        const v = parseNum(String(importRow.platformFee).replace('%', ''));
+        if (Number.isFinite(v)) target.platformFee = clampPercent(v);
+      }
+      if (importRow.targetMargin != null && importRow.targetMargin !== '') {
+        const v = parseNum(String(importRow.targetMargin).replace('%', ''));
+        if (Number.isFinite(v)) target.targetMargin = clampPercent(v);
+      }
+      matched += 1;
+    });
+
+    recalcAllRows();
+    refreshTableBody();
+    refreshActivityInputs();
+
+    showNotice(`导入完成：匹配 ${matched} 行，未匹配 ${unmatched} 行`);
+  }
+
+  function exportMarkdown() {
+    if (rows.length === 0) {
+      showNotice('无 SKU 数据可导出', 'error');
+      return;
+    }
+
+    const { markdown, goodsId, goodsTitle } = buildExportMarkdown();
+    const filename = `${sanitizeFilename(`${goodsId}-${goodsTitle}`)}.md`;
+
+    navigator.clipboard.writeText(markdown).then(() => {
+      showNotice('已复制到剪贴板并下载文件');
+    }).catch(() => {
+      showNotice('剪贴板复制失败，已下载文件', 'error');
+    });
+
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function processImportText(text) {
+    const parsed = parseMarkdownExport(text);
+    if (!parsed.activities && parsed.skuRows.length === 0) {
+      showNotice('未识别有效的 Markdown 导入格式', 'error');
+      return;
+    }
+    applyImportData(parsed);
+  }
+
+  function openImportDialog() {
+    const root = ensureRoot();
+    const layer = document.createElement('div');
+    layer.className = 'pc-import-layer';
+
+    const box = document.createElement('div');
+    box.className = 'pc-import-box';
+
+    const title = document.createElement('h3');
+    title.textContent = '导入 Markdown';
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.md,.txt,text/markdown';
+    fileInput.className = 'pc-import-file';
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'pc-import-text';
+    textarea.placeholder = '或粘贴 Markdown 内容…';
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'pc-import-actions';
+
+    const confirmBtn = document.createElement('button');
+    confirmBtn.type = 'button';
+    confirmBtn.className = 'pc-primary';
+    confirmBtn.textContent = '确认导入';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = '取消';
+
+    const close = () => layer.remove();
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        textarea.value = String(reader.result || '');
+      };
+      reader.readAsText(file);
+    });
+
+    confirmBtn.addEventListener('click', () => {
+      const text = textarea.value.trim();
+      if (!text) {
+        showNotice('请选择文件或粘贴 Markdown 内容', 'error');
+        return;
+      }
+      processImportText(text);
+      close();
+    });
+
+    cancelBtn.addEventListener('click', close);
+    layer.addEventListener('click', (e) => {
+      if (e.target === layer) close();
+    });
+
+    btnRow.appendChild(confirmBtn);
+    btnRow.appendChild(cancelBtn);
+    box.appendChild(title);
+    box.appendChild(fileInput);
+    box.appendChild(textarea);
+    box.appendChild(btnRow);
+    layer.appendChild(box);
+    root.appendChild(layer);
+  }
+
+  /** @type {HTMLTableSectionElement|null} */
+  let tbodyRef = null;
+  /** @type {HTMLElement|null} */
+  let activityPanelRef = null;
+
+  function refreshActivityInputs() {
+    if (!activityPanelRef) return;
+    const couponInput = activityPanelRef.querySelector('[data-pc-act="coupon"]');
+    const tlSelect = activityPanelRef.querySelector('[data-pc-act="tl-type"]');
+    const tlVal = activityPanelRef.querySelector('[data-pc-act="tl-value"]');
+    const tlUnit = activityPanelRef.querySelector('[data-pc-act="tl-unit"]');
+    if (couponInput) couponInput.value = String(globalActivities.coupon.amount);
+    if (tlSelect) tlSelect.value = globalActivities.timeLimit.type;
+    if (tlVal) {
+      tlVal.value = String(globalActivities.timeLimit.value);
+      tlVal.placeholder = globalActivities.timeLimit.type === '打折' ? '六折填60' : '';
+    }
+    if (tlUnit) tlUnit.textContent = globalActivities.timeLimit.type === '打折' ? '%付' : '元';
+  }
+
   function parsePasteValues(text) {
     return String(text || '')
       .replace(/^\uFEFF/, '')
@@ -390,7 +708,7 @@
     if (!tbodyRef || count <= 0) return;
     const trs = tbodyRef.querySelectorAll('tr');
     for (let i = startIndex; i < startIndex + count; i += 1) {
-      const input = trs[i]?.querySelectorAll('td')[1]?.querySelector('input');
+      const input = trs[i]?.querySelector('td[data-pc-field="cost"] input');
       if (input) {
         input.value = rows[i].cost === '' || rows[i].cost == null ? '' : String(rows[i].cost);
       }
@@ -425,7 +743,7 @@
     if (discarded > 0) {
       showNotice(`已粘贴 ${filled} 项，超出 ${discarded} 项已丢弃`);
     } else {
-      showNotice(`已粘贴 ${filled} 项成本`);
+      showNotice(`已粘贴 ${filled} 项采购成本`);
     }
   }
 
@@ -465,18 +783,19 @@
 
   function recalcAllRows() {
     rows.forEach((row) => {
-      const r = calcRow(row, globalActivities);
-      row.groupPrice = r.groupPrice;
-      row.singlePrice = r.singlePrice;
-      row.marginRate = r.marginRate;
+      applyCalcResult(row, calcRow(row, globalActivities));
     });
   }
 
   function injectStyles() {
-    if (document.getElementById('pc-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'pc-styles';
+    let style = document.getElementById('pc-styles');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'pc-styles';
+      document.documentElement.appendChild(style);
+    }
     style.textContent = `
+      #${ROOT_ID} { --pc-r-col-w: 108px; --pc-style-col-w: 160px; }
       #${ROOT_ID} * { box-sizing: border-box; }
       #${ROOT_ID} .pc-fab {
         position: fixed; right: 16px; bottom: 72px; left: auto; top: auto;
@@ -499,7 +818,10 @@
         padding: 12px 16px; border-bottom: 1px solid #e5e7eb;
         display: flex; gap: 8px; align-items: center; flex-shrink: 0;
       }
-      #${ROOT_ID} .pc-header h2 { margin: 0; font-size: 16px; flex: 1; }
+      #${ROOT_ID} .pc-header h2 {
+        margin: 0; font-size: 14px; flex: 1; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
       #${ROOT_ID} .pc-header button {
         padding: 6px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: #f9fafb; cursor: pointer;
       }
@@ -512,37 +834,62 @@
         padding: 6px 8px; background: #fff; vertical-align: middle; white-space: nowrap;
       }
       #${ROOT_ID} .pc-table th { background: #f9fafb; font-weight: 600; position: sticky; top: 0; z-index: 3; }
-      #${ROOT_ID} .pc-table thead tr:first-child th[rowspan="2"] { top: 0; z-index: 5; }
-      #${ROOT_ID} .pc-table thead tr:nth-child(2) th { top: var(--pc-head-row1-h, 80px); z-index: 4; }
+      #${ROOT_ID} .pc-table thead tr:first-child th { top: 0; z-index: 5; }
       #${ROOT_ID} .pc-table input[type=number], #${ROOT_ID} .pc-table input[type=text] {
         width: 72px; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;
       }
       #${ROOT_ID} .pc-table input:read-only { background: #f3f4f6; color: #374151; }
-      #${ROOT_ID} .pc-sticky-1 { position: sticky; left: 0; z-index: 2; min-width: 140px; max-width: 180px; background: #fff; }
-      #${ROOT_ID} .pc-sticky-2 { position: sticky; left: 140px; z-index: 2; min-width: 88px; background: #fff; }
-      #${ROOT_ID} .pc-sticky-3 { position: sticky; left: 228px; z-index: 2; min-width: 100px; box-shadow: 2px 0 4px rgba(0,0,0,.06); background: #fff; }
-      #${ROOT_ID} .pc-sticky-r2 { position: sticky; right: 80px; z-index: 2; min-width: 80px; background: #fff; }
-      #${ROOT_ID} .pc-sticky-r1 { position: sticky; right: 0; z-index: 2; min-width: 80px; box-shadow: -2px 0 4px rgba(0,0,0,.06); background: #fff; }
-      #${ROOT_ID} .pc-table th.pc-sticky-1, #${ROOT_ID} .pc-table th.pc-sticky-2,
-      #${ROOT_ID} .pc-table th.pc-sticky-3 { background: #f9fafb; z-index: 6; }
-      #${ROOT_ID} .pc-table th.pc-sticky-r1, #${ROOT_ID} .pc-table th.pc-sticky-r2 { background: #f9fafb; z-index: 6; }
-      #${ROOT_ID} .pc-table td.pc-sticky-1, #${ROOT_ID} .pc-table td.pc-sticky-2,
-      #${ROOT_ID} .pc-table td.pc-sticky-3, #${ROOT_ID} .pc-table td.pc-sticky-r1,
-      #${ROOT_ID} .pc-table td.pc-sticky-r2 { background: #fff; }
-      #${ROOT_ID} .pc-style-cell { white-space: normal; word-break: break-all; max-width: 180px; }
+      #${ROOT_ID} .pc-sticky-1 {
+        position: sticky; left: 0; z-index: 2;
+        width: var(--pc-style-col-w); min-width: var(--pc-style-col-w); max-width: var(--pc-style-col-w);
+        background: #fff;
+      }
+      #${ROOT_ID} .pc-sticky-r-panel {
+        position: sticky; right: 0; z-index: 6;
+        width: calc(var(--pc-r-col-w) * 3); min-width: calc(var(--pc-r-col-w) * 3);
+        max-width: calc(var(--pc-r-col-w) * 3);
+        background: #f9fafb; box-shadow: -2px 0 4px rgba(0,0,0,.06);
+        vertical-align: top;
+      }
+      #${ROOT_ID} .pc-sticky-r3 {
+        position: sticky; right: calc(var(--pc-r-col-w) * 2); z-index: 2;
+        width: var(--pc-r-col-w); min-width: var(--pc-r-col-w); max-width: var(--pc-r-col-w);
+        background: #fff;
+      }
+      #${ROOT_ID} .pc-sticky-r2 {
+        position: sticky; right: var(--pc-r-col-w); z-index: 2;
+        width: var(--pc-r-col-w); min-width: var(--pc-r-col-w); max-width: var(--pc-r-col-w);
+        background: #fff;
+      }
+      #${ROOT_ID} .pc-sticky-r1 {
+        position: sticky; right: 0; z-index: 2;
+        width: var(--pc-r-col-w); min-width: var(--pc-r-col-w); max-width: var(--pc-r-col-w);
+        box-shadow: -2px 0 4px rgba(0,0,0,.06); background: #fff;
+      }
+      #${ROOT_ID} .pc-table th.pc-sticky-1 { background: #f9fafb; z-index: 7; }
+      #${ROOT_ID} .pc-table th.pc-sticky-r-panel { z-index: 6; }
+      #${ROOT_ID} .pc-table td.pc-sticky-1, #${ROOT_ID} .pc-table td.pc-sticky-r1,
+      #${ROOT_ID} .pc-table td.pc-sticky-r2, #${ROOT_ID} .pc-table td.pc-sticky-r3 { background: #fff; }
+      #${ROOT_ID} .pc-table td.pc-style-cell {
+        white-space: normal !important; word-break: break-all; overflow-wrap: anywhere;
+        line-height: 1.4; vertical-align: top;
+      }
+      #${ROOT_ID} .pc-table th.pc-sticky-1.pc-style-head { white-space: normal; }
       #${ROOT_ID} .pc-activity-box {
-        white-space: normal; min-width: 320px; max-width: 420px; padding: 8px;
+        white-space: normal; padding: 8px;
         font-weight: normal; font-size: 12px; line-height: 1.5;
       }
-      #${ROOT_ID} .pc-activity-grid {
-        display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; align-items: center;
+      #${ROOT_ID} .pc-activity-grid { display: flex; flex-direction: column; gap: 8px; }
+      #${ROOT_ID} .pc-price-subheads {
+        display: grid; grid-template-columns: repeat(3, 1fr);
+        gap: 4px; margin-top: 8px; padding-top: 8px;
+        border-top: 1px solid #e5e7eb;
+        font-weight: 600; font-size: 11px; line-height: 1.3;
+        text-align: center; white-space: normal;
       }
       #${ROOT_ID} .pc-activity-item { display: flex; align-items: center; gap: 4px; min-width: 0; }
       #${ROOT_ID} .pc-activity-item span { flex-shrink: 0; white-space: nowrap; }
-      #${ROOT_ID} .pc-activity-full-row { grid-column: 1 / -1; }
       #${ROOT_ID} .pc-activity-item input[type=text] { width: 52px; flex-shrink: 0; }
-      #${ROOT_ID} .pc-activity-item input[type=checkbox] { flex-shrink: 0; }
-      #${ROOT_ID} .pc-batch-header { font-weight: normal; vertical-align: middle; }
       #${ROOT_ID} .pc-col-header { font-weight: 600; vertical-align: middle; white-space: normal; }
       #${ROOT_ID} .pc-col-header .pc-batch-wrap { margin-top: 6px; }
       #${ROOT_ID} .pc-batch-wrap { display: flex; gap: 4px; align-items: center; justify-content: center; flex-wrap: wrap; }
@@ -559,23 +906,32 @@
         appearance: none; min-width: 72px; height: 28px; cursor: pointer; flex-shrink: 0;
       }
       #${ROOT_ID} .pc-fill-btn {
-        grid-column: 1 / -1;
         margin-top: 4px; width: 100%; padding: 6px 10px; border: none; border-radius: 6px;
         background: #2563eb; color: #fff; cursor: pointer; font-size: 13px;
       }
       #${ROOT_ID} .pc-fill-btn:hover { background: #1d4ed8; }
+      #${ROOT_ID} .pc-import-layer {
+        position: fixed; inset: 0; z-index: 2147483649;
+        background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center;
+      }
+      #${ROOT_ID} .pc-import-box {
+        width: min(560px, 90vw); background: #fff; border-radius: 12px; padding: 16px;
+        box-shadow: 0 12px 40px rgba(0,0,0,.25);
+      }
+      #${ROOT_ID} .pc-import-box h3 { margin: 0 0 12px; font-size: 16px; }
+      #${ROOT_ID} .pc-import-text {
+        width: 100%; min-height: 160px; margin-top: 8px; padding: 8px;
+        border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; resize: vertical;
+      }
+      #${ROOT_ID} .pc-import-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
       #${ROOT_ID} .pc-notice-layer {
-        position: fixed; inset: 0; z-index: 2147483648;
-        display: flex; align-items: center; justify-content: center;
-        pointer-events: none;
+        position: fixed; inset: 0; z-index: 2147483650;
+        display: flex; align-items: center; justify-content: center; pointer-events: none;
       }
       #${ROOT_ID} .pc-notice {
-        pointer-events: auto;
-        display: flex; align-items: flex-start; gap: 12px;
-        min-width: 280px; max-width: 420px;
-        padding: 16px 18px; border-radius: 10px;
-        background: #fff; box-shadow: 0 10px 40px rgba(0,0,0,.2);
-        border: 1px solid #e5e7eb;
+        pointer-events: auto; display: flex; align-items: flex-start; gap: 12px;
+        min-width: 280px; max-width: 420px; padding: 16px 18px; border-radius: 10px;
+        background: #fff; box-shadow: 0 10px 40px rgba(0,0,0,.2); border: 1px solid #e5e7eb;
         transform: translateY(-10px) scale(.98); opacity: 0;
         transition: opacity .22s ease, transform .22s ease;
       }
@@ -595,8 +951,8 @@
       #${ROOT_ID} .pc-notice-close:hover { color: #6b7280; }
       #${ROOT_ID} .pc-empty { padding: 48px 24px; text-align: center; color: #6b7280; }
       #${ROOT_ID} .pc-result { font-variant-numeric: tabular-nums; }
+      #${ROOT_ID} .pc-readonly { font-variant-numeric: tabular-nums; color: #374151; }
     `;
-    document.documentElement.appendChild(style);
   }
 
   function ensureRoot() {
@@ -610,9 +966,7 @@
     return root;
   }
 
-  /** @type {ReturnType<typeof setTimeout>|null} */
   let noticeTimer = null;
-  /** @type {ReturnType<typeof setTimeout>|null} */
   let noticeRemoveTimer = null;
 
   function removeNoticeLayer(overlay) {
@@ -769,17 +1123,8 @@
     });
   }
 
-  /** @type {HTMLTableSectionElement|null} */
-  let tbodyRef = null;
-
   function refreshTableBody() {
     if (tbodyRef) renderDataRows(tbodyRef);
-  }
-
-  function updateStickyHeaderOffset(table) {
-    const row1 = table.querySelector('thead tr:first-child');
-    if (!row1) return;
-    table.style.setProperty('--pc-head-row1-h', `${row1.getBoundingClientRect().height}px`);
   }
 
   function appendBatchControls(th, field, options = {}) {
@@ -804,7 +1149,8 @@
       if (options.isPercent) v = clampPercent(v);
       if (options.min != null) v = Math.max(options.min, v);
       rows.forEach((row) => {
-        row[field] = v;
+        if (field === 'cost') row[field] = String(v);
+        else row[field] = v;
       });
       onTableDataChange();
       showNotice(`批量设置完成：已设置 ${rows.length} 行`);
@@ -817,7 +1163,6 @@
 
   function createSimpleHeaderTh(text, className) {
     const th = document.createElement('th');
-    th.rowSpan = 2;
     if (className) th.className = className;
     th.innerHTML = `<span class="pc-th-title">${text}</span>`;
     return th;
@@ -825,34 +1170,23 @@
 
   function createColumnHeaderTh(text, field, className, batchOptions = {}) {
     const th = document.createElement('th');
-    th.rowSpan = 2;
     th.className = ['pc-col-header', className].filter(Boolean).join(' ');
     th.innerHTML = `<span class="pc-th-title">${text}</span>`;
     appendBatchControls(th, field, batchOptions);
     return th;
   }
 
+  function createReadonlyTd(value, extraClass) {
+    const td = document.createElement('td');
+    if (extraClass) td.className = extraClass;
+    td.classList.add('pc-readonly');
+    td.textContent = value;
+    return td;
+  }
+
   function recalcAndUpdateOutputs() {
     recalcAllRows();
-    if (!tbodyRef) return;
-    const trs = tbodyRef.querySelectorAll('tr');
-    rows.forEach((row, i) => {
-      const tr = trs[i];
-      if (!tr) return;
-      const cells = tr.querySelectorAll('td');
-      const marginInput = cells[5]?.querySelector('input');
-      if (marginInput) {
-        marginInput.value = row.marginRate != null ? `${row.marginRate}%` : '—';
-      }
-      const groupCell = cells[7];
-      if (groupCell) {
-        groupCell.textContent = row.groupPrice != null ? row.groupPrice.toFixed(2) : '—';
-      }
-      const singleCell = cells[8];
-      if (singleCell) {
-        singleCell.textContent = row.singlePrice != null ? row.singlePrice.toFixed(2) : '—';
-      }
-    });
+    refreshTableBody();
   }
 
   function onTableInputChange() {
@@ -868,33 +1202,6 @@
     recalcAndUpdateOutputs();
   }
 
-  function createActivityLine(label, actKey) {
-    const line = document.createElement('div');
-    line.className = 'pc-activity-item';
-
-    const span = document.createElement('span');
-    span.textContent = label;
-
-    const amt = document.createElement('input');
-    amt.value = String(globalActivities[actKey].amount);
-
-    const unit = document.createElement('span');
-    unit.textContent = '元';
-
-    bindGlobalDecimalInput(
-      amt,
-      () => globalActivities[actKey].amount,
-      (v) => { globalActivities[actKey].amount = v; },
-      onActivityChange,
-      { min: 0 },
-    );
-
-    line.appendChild(span);
-    line.appendChild(amt);
-    line.appendChild(unit);
-    return line;
-  }
-
   function renderDataRows(tbody) {
     tbody.innerHTML = '';
     rows.forEach((row) => {
@@ -905,9 +1212,9 @@
       tdStyle.textContent = row.style;
 
       const tdCost = document.createElement('td');
-      tdCost.className = 'pc-sticky-2';
+      tdCost.dataset.pcField = 'cost';
       const costInput = document.createElement('input');
-      costInput.placeholder = '成本';
+      costInput.placeholder = '采购成本';
       costInput.value = row.cost;
       bindDecimalField(costInput, row, 'cost', onTableInputChange, { allowEmpty: true, storeString: true, min: 0 });
       costInput.addEventListener('beforeinput', (e) => {
@@ -918,15 +1225,6 @@
         pasteCostsFromRow(row, e.clipboardData?.getData('text') || '');
       });
       tdCost.appendChild(costInput);
-
-      const tdTarget = document.createElement('td');
-      tdTarget.className = 'pc-sticky-3';
-      const targetInput = document.createElement('input');
-      targetInput.value = String(row.targetMargin);
-      bindDecimalField(targetInput, row, 'targetMargin', onTableInputChange, {
-        clampPercent: true, defaultValue: DEFAULTS.targetMargin,
-      });
-      tdTarget.appendChild(targetInput);
 
       const tdFreight = document.createElement('td');
       const freightInput = document.createElement('input');
@@ -942,13 +1240,6 @@
       });
       tdReturn.appendChild(returnInput);
 
-      const tdMargin = document.createElement('td');
-      const marginInput = document.createElement('input');
-      marginInput.type = 'text';
-      marginInput.readOnly = true;
-      marginInput.value = row.marginRate != null ? `${row.marginRate}%` : '—';
-      tdMargin.appendChild(marginInput);
-
       const tdPlatform = document.createElement('td');
       const platformInput = document.createElement('input');
       platformInput.value = String(row.platformFee);
@@ -957,21 +1248,38 @@
       });
       tdPlatform.appendChild(platformInput);
 
-      const tdGroup = document.createElement('td');
-      tdGroup.className = 'pc-sticky-r2 pc-result';
-      tdGroup.textContent = row.groupPrice != null ? row.groupPrice.toFixed(2) : '—';
+      const tdTarget = document.createElement('td');
+      const targetInput = document.createElement('input');
+      targetInput.value = String(row.targetMargin);
+      bindDecimalField(targetInput, row, 'targetMargin', onTableInputChange, {
+        clampPercent: true, defaultValue: DEFAULTS.targetMargin,
+      });
+      tdTarget.appendChild(targetInput);
 
-      const tdSingle = document.createElement('td');
-      tdSingle.className = 'pc-sticky-r1 pc-result';
-      tdSingle.textContent = row.singlePrice != null ? row.singlePrice.toFixed(2) : '—';
+      const tdActualCost = createReadonlyTd(formatNum(row.actualCost));
+      const tdMargin = createReadonlyTd(formatPct(row.marginRate));
+      const tdProfit = createReadonlyTd(formatNum(row.actualProfit));
+      const tdNetRoi = createReadonlyTd(formatNum(row.netBreakEvenRoi));
+      const tdMicroRoi = createReadonlyTd(formatNum(row.microPaidRoi));
+      const tdOptimalRoi = createReadonlyTd(formatNum(row.optimalRoi));
+
+      const tdActualGroup = createReadonlyTd(formatNum(row.actualGroupPrice), 'pc-sticky-r3 pc-result');
+      const tdGroup = createReadonlyTd(formatNum(row.groupPrice), 'pc-sticky-r2 pc-result');
+      const tdSingle = createReadonlyTd(formatNum(row.singlePrice), 'pc-sticky-r1 pc-result');
 
       tr.appendChild(tdStyle);
       tr.appendChild(tdCost);
-      tr.appendChild(tdTarget);
       tr.appendChild(tdFreight);
       tr.appendChild(tdReturn);
-      tr.appendChild(tdMargin);
       tr.appendChild(tdPlatform);
+      tr.appendChild(tdTarget);
+      tr.appendChild(tdActualCost);
+      tr.appendChild(tdMargin);
+      tr.appendChild(tdProfit);
+      tr.appendChild(tdNetRoi);
+      tr.appendChild(tdMicroRoi);
+      tr.appendChild(tdOptimalRoi);
+      tr.appendChild(tdActualGroup);
       tr.appendChild(tdGroup);
       tr.appendChild(tdSingle);
       tbody.appendChild(tr);
@@ -980,23 +1288,41 @@
 
   function buildActivityHeaderCell() {
     const th = document.createElement('th');
-    th.colSpan = 2;
-    th.className = 'pc-activity-box';
+    th.colSpan = 3;
+    th.className = 'pc-activity-box pc-sticky-r-panel';
 
     const grid = document.createElement('div');
     grid.className = 'pc-activity-grid';
-    grid.appendChild(createActivityLine('订单复购券', 'reorder'));
-    grid.appendChild(createActivityLine('店铺关注券', 'follow'));
-    grid.appendChild(createActivityLine('新客立减券', 'newCustomer'));
-    grid.appendChild(createActivityLine('直播券', 'live'));
-    grid.appendChild(createActivityLine('场景券', 'scene'));
+    activityPanelRef = grid;
+
+    const couponLine = document.createElement('div');
+    couponLine.className = 'pc-activity-item';
+    const couponLabel = document.createElement('span');
+    couponLabel.textContent = '立减优惠券';
+    const couponInput = document.createElement('input');
+    couponInput.dataset.pcAct = 'coupon';
+    couponInput.value = String(globalActivities.coupon.amount);
+    const couponUnit = document.createElement('span');
+    couponUnit.textContent = '元';
+    bindGlobalDecimalInput(
+      couponInput,
+      () => globalActivities.coupon.amount,
+      (v) => { globalActivities.coupon.amount = v; },
+      onActivityChange,
+      { min: 0 },
+    );
+    couponLine.appendChild(couponLabel);
+    couponLine.appendChild(couponInput);
+    couponLine.appendChild(couponUnit);
+    grid.appendChild(couponLine);
 
     const tlLine = document.createElement('div');
-    tlLine.className = 'pc-activity-item pc-activity-full-row';
+    tlLine.className = 'pc-activity-item';
     const tlLabel = document.createElement('span');
     tlLabel.textContent = '限时限量购';
     const tlSelect = document.createElement('select');
     tlSelect.className = 'pc-activity-select';
+    tlSelect.dataset.pcAct = 'tl-type';
     ['立减', '打折'].forEach((opt) => {
       const o = document.createElement('option');
       o.value = opt;
@@ -1005,9 +1331,11 @@
       tlSelect.appendChild(o);
     });
     const tlVal = document.createElement('input');
+    tlVal.dataset.pcAct = 'tl-value';
     tlVal.value = String(globalActivities.timeLimit.value);
     tlVal.placeholder = globalActivities.timeLimit.type === '打折' ? '六折填60' : '';
     const tlUnit = document.createElement('span');
+    tlUnit.dataset.pcAct = 'tl-unit';
     tlUnit.textContent = globalActivities.timeLimit.type === '打折' ? '%付' : '元';
 
     const tlRefreshMeta = () => {
@@ -1046,7 +1374,16 @@
     fillBtn.addEventListener('click', fillBackAll);
     grid.appendChild(fillBtn);
 
+    const subheads = document.createElement('div');
+    subheads.className = 'pc-price-subheads';
+    ['实际拼单价（元）', '拼单价（元）', '单买价（元）'].forEach((label) => {
+      const span = document.createElement('span');
+      span.textContent = label;
+      subheads.appendChild(span);
+    });
+
     th.appendChild(grid);
+    th.appendChild(subheads);
     return th;
   }
 
@@ -1067,7 +1404,21 @@
     const header = document.createElement('div');
     header.className = 'pc-header';
     const title = document.createElement('h2');
-    title.textContent = rows.length > 0 ? `价格计算器 — 共 ${rows.length} 个 SKU` : '价格计算器 — 未找到 SKU 表格';
+    const { goodsId, goodsTitle } = getGoodsMeta();
+    title.textContent = rows.length > 0
+      ? `${goodsId}-${goodsTitle}`
+      : `${goodsId}-${goodsTitle}（未找到 SKU 表格）`;
+    title.title = title.textContent;
+
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'pc-primary';
+    exportBtn.textContent = '导出';
+    exportBtn.addEventListener('click', exportMarkdown);
+
+    const importBtn = document.createElement('button');
+    importBtn.className = 'pc-primary';
+    importBtn.textContent = '导入';
+    importBtn.addEventListener('click', openImportDialog);
 
     const refreshBtn = document.createElement('button');
     refreshBtn.textContent = '刷新';
@@ -1081,6 +1432,8 @@
     });
 
     header.appendChild(title);
+    header.appendChild(exportBtn);
+    header.appendChild(importBtn);
     header.appendChild(refreshBtn);
     header.appendChild(closeBtn);
 
@@ -1098,41 +1451,22 @@
 
       const thead = document.createElement('thead');
       const headRow1 = document.createElement('tr');
-      const headRow2 = document.createElement('tr');
 
-      headRow1.appendChild(createSimpleHeaderTh('款式', 'pc-sticky-1'));
-      headRow1.appendChild(createSimpleHeaderTh('成本（含人工）（元）', 'pc-sticky-2'));
-      headRow1.appendChild(createColumnHeaderTh('目标销售利润率（%）', 'targetMargin', 'pc-sticky-3', {
-        isPercent: true,
-        placeholder: '%',
-      }));
-      headRow1.appendChild(createColumnHeaderTh('运费（运费险）（元）', 'freight', null, {
-        min: 0,
-        placeholder: '元',
-      }));
-      headRow1.appendChild(createColumnHeaderTh('退货率（%）', 'returnRate', null, {
-        isPercent: true,
-        placeholder: '%',
-      }));
+      headRow1.appendChild(createSimpleHeaderTh('款式', 'pc-sticky-1 pc-style-head'));
+      headRow1.appendChild(createColumnHeaderTh('采购成本（元）', 'cost', null, { min: 0, placeholder: '元' }));
+      headRow1.appendChild(createColumnHeaderTh('运费（元）', 'freight', null, { min: 0, placeholder: '元' }));
+      headRow1.appendChild(createColumnHeaderTh('退货率（%）', 'returnRate', null, { isPercent: true, placeholder: '%' }));
+      headRow1.appendChild(createColumnHeaderTh('平台扣点（%）', 'platformFee', null, { isPercent: true, placeholder: '%' }));
+      headRow1.appendChild(createColumnHeaderTh('目标利润率（%）', 'targetMargin', null, { isPercent: true, placeholder: '%' }));
+      headRow1.appendChild(createSimpleHeaderTh('实际成本（元）'));
       headRow1.appendChild(createSimpleHeaderTh('实际利润率（%）'));
-      headRow1.appendChild(createColumnHeaderTh('平台扣点（%）', 'platformFee', null, {
-        decimal: true,
-        isPercent: true,
-        placeholder: '%',
-      }));
+      headRow1.appendChild(createSimpleHeaderTh('实际利润（元）'));
+      headRow1.appendChild(createSimpleHeaderTh('净保本投产比'));
+      headRow1.appendChild(createSimpleHeaderTh('微付费投产比'));
+      headRow1.appendChild(createSimpleHeaderTh('最佳投产比'));
       headRow1.appendChild(buildActivityHeaderCell());
 
-      const hGroup = document.createElement('th');
-      hGroup.className = 'pc-sticky-r2';
-      hGroup.textContent = '拼单价（元）';
-      const hSingle = document.createElement('th');
-      hSingle.className = 'pc-sticky-r1';
-      hSingle.textContent = '单买价（元）';
-      headRow2.appendChild(hGroup);
-      headRow2.appendChild(hSingle);
-
       thead.appendChild(headRow1);
-      thead.appendChild(headRow2);
 
       const tbody = document.createElement('tbody');
       tbodyRef = tbody;
@@ -1142,7 +1476,6 @@
       table.appendChild(tbody);
       wrap.appendChild(table);
       body.appendChild(wrap);
-      requestAnimationFrame(() => updateStickyHeaderOffset(table));
     }
 
     panel.appendChild(header);
@@ -1250,23 +1583,28 @@
     root.appendChild(fab);
   }
 
-  /* 公式自检：平台扣点 0% 时 成本 5.94 → 拼单价 7.92 */
   function selfTestFormulas() {
     const row = {
       cost: '5.94',
       freight: 0,
       returnRate: 20,
       targetMargin: 20,
-      platformFee: 0,
+      platformFee: 0.6,
       singleRandomOffset: 4,
     };
-    const r0 = calcRow(row, createDefaultActivities());
-    console.assert(r0.groupPrice === 7.92, `expected group 7.92 got ${r0.groupPrice}`);
-    console.assert(r0.singlePrice === calcSinglePrice(7.92, 0, 0, 4), `expected single ${calcSinglePrice(7.92, 0, 0, 4)} got ${r0.singlePrice}`);
+    const acts = createDefaultActivities();
+    const r = calcRow(row, acts);
+    console.assert(r.actualGroupPrice === 7.13, `expected actualGroup 7.13 got ${r.actualGroupPrice}`);
+    console.assert(r.groupPrice === 7.13, `expected group 7.13 got ${r.groupPrice}`);
+    console.assert(r.actualProfit === 1.15, `expected profit 1.15 got ${r.actualProfit}`);
+    console.assert(r.netBreakEvenRoi === 7.75, `expected netRoi 7.75 got ${r.netBreakEvenRoi}`);
+    console.assert(r.microPaidRoi === 4.38, `expected microRoi 4.38 got ${r.microPaidRoi}`);
+    console.assert(r.optimalRoi === 15.5, `expected optimalRoi 15.5 got ${r.optimalRoi}`);
 
-    row.platformFee = 0.6;
-    const r1 = calcRow(row, createDefaultActivities());
-    console.assert(r1.groupPrice > 7.92, `expected group > 7.92 with fee got ${r1.groupPrice}`);
+    acts.coupon.amount = 5;
+    const r2 = calcRow(row, acts);
+    console.assert(r2.groupPrice === 12.13, `expected group 12.13 got ${r2.groupPrice}`);
+    console.assert(r2.actualGroupPrice === 7.13, `actualGroup unchanged got ${r2.actualGroupPrice}`);
   }
 
   selfTestFormulas();

@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         规格名称批量粘贴
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.0.7
+// @version      1.0.10
 // @description  拼多多商家后台商品规格编辑页：在第一个规格名称框粘贴多值，自动拆分并依次填充
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -61,31 +61,20 @@
 
   function setInputValue(input, value) {
     if (!input) return false;
-    const strValue = String(value);
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-    setter.call(input, strValue);
-    input.dispatchEvent(new InputEvent('input', {
-      bubbles: true,
-      cancelable: true,
-      inputType: 'insertFromPaste',
-      data: strValue === '' ? null : strValue,
-    }));
+    setter.call(input, String(value));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
     return true;
-  }
-
-  function dispatchBlur(input) {
-    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
-    input.dispatchEvent(new FocusEvent('blur', { bubbles: false, cancelable: true }));
-    input.blur();
   }
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  function waitForSpecInput(groupRoot, index, timeout = WAIT_TIMEOUT_MS) {
+  function waitForSpecInput(groupRoot, index, minLength, timeout = WAIT_TIMEOUT_MS) {
     const start = Date.now();
+    const requiredLength = minLength != null ? minLength : index + 1;
 
     return new Promise((resolve) => {
       let pollTimer = null;
@@ -98,7 +87,7 @@
 
       const check = () => {
         const inputs = [...groupRoot.querySelectorAll(SPEC_INPUT_SELECTOR)];
-        if (inputs[index]) {
+        if (inputs.length >= requiredLength && inputs[index]) {
           cleanup();
           resolve(inputs[index]);
           return true;
@@ -156,42 +145,55 @@
     }, TOAST_DURATION_MS);
   }
 
-  async function fillAndBlur(input, value) {
+  async function commitSpecInput(input, value) {
+    input.focus();
     setInputValue(input, value);
-    dispatchBlur(input);
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
+    input.blur();
     await delay(FILL_STEP_DELAY_MS);
+  }
+
+  async function clearSpecInput(input) {
+    if (input.value === '') return;
+    input.focus();
+    setInputValue(input, '');
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
+    input.blur();
+    await delay(FILL_STEP_DELAY_MS);
+  }
+
+  async function clearSpecInputsFromIndex(groupRoot, fromIndex) {
+    const inputs = [...groupRoot.querySelectorAll(SPEC_INPUT_SELECTOR)];
+    for (let j = inputs.length - 1; j >= fromIndex; j -= 1) {
+      await clearSpecInput(inputs[j]);
+    }
   }
 
   async function fillSpecGroup(firstInput, names) {
     const groupRoot = findGroupRoot(firstInput);
     let filled = 0;
 
+    // 先清空 sibling 框，避免写入首项 blur 校验时与旧值撞重复名
+    await clearSpecInputsFromIndex(groupRoot, 1);
+
     for (let i = 0; i < names.length; i += 1) {
       let input;
       if (i === 0) {
         input = firstInput;
       } else {
-        input = await waitForSpecInput(groupRoot, i);
+        const minLength = i + 1;
+        input = await waitForSpecInput(groupRoot, i, minLength);
         if (!input) {
           const remaining = names.length - filled;
           showToast(`已填充 ${filled} 项，剩余 ${remaining} 项超时未填入`);
           return { filled, remaining };
         }
       }
-      if (i === 0) {
-        setInputValue(input, names[i]);
-        dispatchBlur(input);
-        await delay(FILL_STEP_DELAY_MS);
-      } else {
-        await fillAndBlur(input, names[i]);
-      }
+      await commitSpecInput(input, names[i]);
       filled += 1;
     }
 
-    const allInputs = [...groupRoot.querySelectorAll(SPEC_INPUT_SELECTOR)];
-    for (let j = names.length; j < allInputs.length; j += 1) {
-      await fillAndBlur(allInputs[j], '');
-    }
+    await clearSpecInputsFromIndex(groupRoot, names.length);
 
     showToast(`已填充 ${filled} 项规格`);
     return { filled, remaining: 0 };
@@ -212,19 +214,22 @@
     }
   }
 
-  document.addEventListener('beforeinput', (e) => {
-    if (isFilling) return;
-    if (e.inputType !== 'insertFromPaste') return;
-    if (!isFirstSpecInput(e.target)) return;
+  function interceptPasteEvent(e) {
+    if (!isFirstSpecInput(e.target)) return false;
     e.preventDefault();
+    e.stopImmediatePropagation();
+    if (isFilling) return false;
+    return true;
+  }
+
+  document.addEventListener('beforeinput', (e) => {
+    if (e.inputType !== 'insertFromPaste') return;
+    interceptPasteEvent(e);
   }, true);
 
   document.addEventListener('paste', (e) => {
-    if (isFilling) return;
-    const target = e.target;
-    if (!isFirstSpecInput(target)) return;
-    e.preventDefault();
+    if (!interceptPasteEvent(e)) return;
     const text = e.clipboardData?.getData('text') || '';
-    handlePaste(target, text);
+    void handlePaste(e.target, text);
   }, true);
 })();
