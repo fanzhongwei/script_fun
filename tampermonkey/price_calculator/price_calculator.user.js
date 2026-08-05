@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.4.2
+// @version      1.4.4
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -76,6 +76,13 @@
     return clampPercent(pct) / 100;
   }
 
+  /** 目标利润率：仅限制 ≥0，不封顶 100% */
+  function targetMarginToDecimal(pct) {
+    const n = parseNum(pct);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return n / 100;
+  }
+
   function randomSingleOffset() {
     return round2(3 + Math.random() * 2);
   }
@@ -112,7 +119,7 @@
     const E = parseNum(row.freight);
     const G = pctToDecimal(row.returnRate);
     const I = pctToDecimal(row.platformFee);
-    const J = pctToDecimal(row.targetMargin);
+    const J = targetMarginToDecimal(row.targetMargin);
 
     if (!(C > 0) || !Number.isFinite(E) || E < 0) return emptyCalcResult();
 
@@ -137,8 +144,8 @@
     let microPaidRoi = null;
     let optimalRoi = null;
 
-    if (actualGroupPrice > 0) {
-      marginRate = round2((actualProfit / actualGroupPrice) * 100);
+    if (actualCost > 0) {
+      marginRate = round2((actualProfit / actualCost) * 100);
     }
 
     if (actualProfit > 0 && actualGroupPrice > 0 && G < 1) {
@@ -562,7 +569,7 @@
       }
       if (importRow.targetMargin != null && importRow.targetMargin !== '') {
         const v = parseNum(String(importRow.targetMargin).replace('%', ''));
-        if (Number.isFinite(v)) target.targetMargin = clampPercent(v);
+        if (Number.isFinite(v)) target.targetMargin = Math.max(0, v);
       }
       matched += 1;
     });
@@ -887,6 +894,7 @@
         font-weight: 600; font-size: 11px; line-height: 1.3;
         text-align: center; white-space: normal;
       }
+      #${ROOT_ID} .pc-price-subheads .pc-th-formula { font-size: 9px; margin-top: 2px; }
       #${ROOT_ID} .pc-activity-item { display: flex; align-items: center; gap: 4px; min-width: 0; }
       #${ROOT_ID} .pc-activity-item span { flex-shrink: 0; white-space: nowrap; }
       #${ROOT_ID} .pc-activity-item input[type=text] { width: 52px; flex-shrink: 0; }
@@ -900,6 +908,10 @@
       }
       #${ROOT_ID} .pc-batch-btn:hover { background: #eff6ff; border-color: #2563eb; color: #2563eb; }
       #${ROOT_ID} .pc-th-title { display: block; font-weight: 600; margin-bottom: 2px; }
+      #${ROOT_ID} .pc-th-formula {
+        display: block; font-weight: normal; font-size: 10px; color: #6b7280;
+        line-height: 1.35; margin-top: 2px; white-space: normal; word-break: break-all;
+      }
       #${ROOT_ID} .pc-activity-select {
         font-size: 12px; padding: 4px 24px 4px 8px; border: 1px solid #d1d5db; border-radius: 4px;
         background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236b7280' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E") no-repeat right 6px center;
@@ -1147,6 +1159,7 @@
         return;
       }
       if (options.isPercent) v = clampPercent(v);
+      if (options.unboundedPercent) v = Math.max(0, v);
       if (options.min != null) v = Math.max(options.min, v);
       rows.forEach((row) => {
         if (field === 'cost') row[field] = String(v);
@@ -1161,17 +1174,21 @@
     th.appendChild(wrap);
   }
 
-  function createSimpleHeaderTh(text, className) {
+  function createSimpleHeaderTh(text, className, formula) {
     const th = document.createElement('th');
     if (className) th.className = className;
-    th.innerHTML = `<span class="pc-th-title">${text}</span>`;
+    let html = `<span class="pc-th-title">${text}</span>`;
+    if (formula) html += `<span class="pc-th-formula">${formula}</span>`;
+    th.innerHTML = html;
     return th;
   }
 
-  function createColumnHeaderTh(text, field, className, batchOptions = {}) {
+  function createColumnHeaderTh(text, field, className, batchOptions = {}, formula) {
     const th = document.createElement('th');
     th.className = ['pc-col-header', className].filter(Boolean).join(' ');
-    th.innerHTML = `<span class="pc-th-title">${text}</span>`;
+    let html = `<span class="pc-th-title">${text}</span>`;
+    if (formula) html += `<span class="pc-th-formula">${formula}</span>`;
+    th.innerHTML = html;
     appendBatchControls(th, field, batchOptions);
     return th;
   }
@@ -1252,7 +1269,7 @@
       const targetInput = document.createElement('input');
       targetInput.value = String(row.targetMargin);
       bindDecimalField(targetInput, row, 'targetMargin', onTableInputChange, {
-        clampPercent: true, defaultValue: DEFAULTS.targetMargin,
+        min: 0, defaultValue: DEFAULTS.targetMargin,
       });
       tdTarget.appendChild(targetInput);
 
@@ -1376,10 +1393,14 @@
 
     const subheads = document.createElement('div');
     subheads.className = 'pc-price-subheads';
-    ['实际拼单价（元）', '拼单价（元）', '单买价（元）'].forEach((label) => {
-      const span = document.createElement('span');
-      span.textContent = label;
-      subheads.appendChild(span);
+    [
+      { label: '实际拼单价（元）', formula: '实际成本×(1+目标利润率)' },
+      { label: '拼单价（元）', formula: '实际拼单价+活动优惠' },
+      { label: '单买价（元）', formula: '实际拼单价×1.1+券+限时+随机' },
+    ].forEach(({ label, formula }) => {
+      const cell = document.createElement('span');
+      cell.innerHTML = `${label}<span class="pc-th-formula">${formula}</span>`;
+      subheads.appendChild(cell);
     });
 
     th.appendChild(grid);
@@ -1457,13 +1478,15 @@
       headRow1.appendChild(createColumnHeaderTh('运费（元）', 'freight', null, { min: 0, placeholder: '元' }));
       headRow1.appendChild(createColumnHeaderTh('退货率（%）', 'returnRate', null, { isPercent: true, placeholder: '%' }));
       headRow1.appendChild(createColumnHeaderTh('平台扣点（%）', 'platformFee', null, { isPercent: true, placeholder: '%' }));
-      headRow1.appendChild(createColumnHeaderTh('目标利润率（%）', 'targetMargin', null, { isPercent: true, placeholder: '%' }));
-      headRow1.appendChild(createSimpleHeaderTh('实际成本（元）'));
-      headRow1.appendChild(createSimpleHeaderTh('实际利润率（%）'));
-      headRow1.appendChild(createSimpleHeaderTh('实际利润（元）'));
-      headRow1.appendChild(createSimpleHeaderTh('净保本投产比'));
-      headRow1.appendChild(createSimpleHeaderTh('微付费投产比'));
-      headRow1.appendChild(createSimpleHeaderTh('最佳投产比'));
+      headRow1.appendChild(createColumnHeaderTh('目标利润率（%）', 'targetMargin', null, {
+        unboundedPercent: true, placeholder: '%',
+      }, '实际拼单价的加成比例，可超过100%'));
+      headRow1.appendChild(createSimpleHeaderTh('实际成本（元）', null, '采购成本+运费'));
+      headRow1.appendChild(createSimpleHeaderTh('实际利润率（%）', null, '实际利润÷实际成本×100'));
+      headRow1.appendChild(createSimpleHeaderTh('实际利润（元）', null, '实际拼单价×(1-扣点)-采购成本-运费'));
+      headRow1.appendChild(createSimpleHeaderTh('净保本投产比', null, '(实际拼单价÷实际利润)÷(1-退货率)'));
+      headRow1.appendChild(createSimpleHeaderTh('微付费投产比', null, '净保本÷2+0.5'));
+      headRow1.appendChild(createSimpleHeaderTh('最佳投产比', null, '净保本×1.4(>50%)或×2(≤50%)'));
       headRow1.appendChild(buildActivityHeaderCell());
 
       thead.appendChild(headRow1);
@@ -1597,6 +1620,7 @@
     console.assert(r.actualGroupPrice === 7.13, `expected actualGroup 7.13 got ${r.actualGroupPrice}`);
     console.assert(r.groupPrice === 7.13, `expected group 7.13 got ${r.groupPrice}`);
     console.assert(r.actualProfit === 1.15, `expected profit 1.15 got ${r.actualProfit}`);
+    console.assert(r.marginRate === 19.36, `expected marginRate 19.36 got ${r.marginRate}`);
     console.assert(r.netBreakEvenRoi === 7.75, `expected netRoi 7.75 got ${r.netBreakEvenRoi}`);
     console.assert(r.microPaidRoi === 4.38, `expected microRoi 4.38 got ${r.microPaidRoi}`);
     console.assert(r.optimalRoi === 15.5, `expected optimalRoi 15.5 got ${r.optimalRoi}`);
