@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.4.4
+// @version      1.5.5
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -54,8 +54,173 @@
   function createDefaultActivities() {
     return {
       coupon: { amount: 0 },
-      timeLimit: { type: '立减', value: 0 },
+      timeLimit: { type: '打折', value: 85 },
     };
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** 在 table 内部查询行（不可带 #sku 前缀） */
+  const SKU_ROW_IN_TABLE = 'tbody tr[class*="TB_tr"], tbody [data-testid="beast-core-table-body-tr"]';
+
+  /**
+   * 定位内层滚动容器（不是 TB_innerMiddle）：
+   * TB_body >
+   *   <div style="max-height:820px;height:820px;overflow-y:scroll">  ← 改这里
+   *     <div style="padding-top/bottom">
+   *       <table.TB_tableWrapper>
+   */
+  function getSkuScrollViewport() {
+    const skuRoot = document.querySelector('#sku, #goods-spec-sku');
+    if (!skuRoot || skuRoot.closest(`#${ROOT_ID}`)) return null;
+
+    const body = skuRoot.querySelector(
+      '[data-testid="beast-core-table-middle-body"], [class*="TB_body"]',
+    );
+    if (!body || body.closest(`#${ROOT_ID}`)) return null;
+
+    // 只认 TB_body 的直接子节点里包着 table 的那个滚动层
+    for (const child of Array.from(body.children)) {
+      if (!child.querySelector('table[class*="TB_tableWrapper"]')) continue;
+      const style = child.getAttribute('style') || '';
+      const cs = getComputedStyle(child);
+      const looksLikeScroll = /max-height|overflow-y|height\s*:/i.test(style)
+        || cs.overflowY === 'scroll'
+        || cs.overflowY === 'auto'
+        || (cs.maxHeight && cs.maxHeight !== 'none');
+      if (looksLikeScroll) return child;
+    }
+
+    // 兜底：TB_body 下第一个包含 table 的直接子 div
+    return Array.from(body.children).find(
+      (child) => child.querySelector('table[class*="TB_tableWrapper"]'),
+    ) || null;
+  }
+
+  function getSkuSpacer(viewport) {
+    if (!viewport) return null;
+    const direct = viewport.querySelector(':scope > div');
+    if (direct && direct.querySelector('table[class*="TB_tableWrapper"]')) return direct;
+    const table = viewport.querySelector('table[class*="TB_tableWrapper"]');
+    return table ? table.parentElement : null;
+  }
+
+  /** 虚拟总高度 = paddingTop + 当前行总高 + paddingBottom（与手动改 11820px 同源） */
+  function measureVirtualContentHeight(viewport) {
+    const spacer = getSkuSpacer(viewport);
+    const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
+    const rows = table.querySelectorAll(SKU_ROW_IN_TABLE);
+    let rowsH = 0;
+    rows.forEach((row) => { rowsH += row.getBoundingClientRect().height || 0; });
+    if (rowsH < 1 && rows.length > 0) rowsH = rows.length * 69;
+
+    const pt = spacer ? (parseFloat(spacer.style.paddingTop) || 0) : 0;
+    const pb = spacer ? (parseFloat(spacer.style.paddingBottom) || 0) : 0;
+    return Math.max(pt + rowsH + pb, viewport.scrollHeight, table.scrollHeight || 0, rowsH);
+  }
+
+  /**
+   * 对齐手动改法：
+   * viewport.style = max-height/height = 总高度; overflow-y: scroll
+   * spacer.style   = padding-top/bottom = 0
+   */
+  async function loadAllVirtualSkuRows() {
+    const viewport = getSkuScrollViewport();
+    if (!viewport) return;
+
+    if (viewport.dataset.pcSkuExpanded === '1') {
+      const rows = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
+      if (rows > 0 && viewport.clientHeight >= measureVirtualContentHeight(viewport) - 4) return;
+    }
+    delete viewport.dataset.pcSkuExpanded;
+
+    // 阶段1：保持可滚动，滚到底测虚拟总高
+    viewport.style.maxHeight = '820px';
+    viewport.style.height = '820px';
+    viewport.style.overflowY = 'scroll';
+
+    let maxH = 0;
+    let lastScrollH = 0;
+    let stable = 0;
+    for (let i = 0; i < 120; i += 1) {
+      viewport.scrollTop = viewport.scrollHeight;
+      await sleep(40);
+      maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+      const scrollH = viewport.scrollHeight;
+      if (viewport.scrollTop + viewport.clientHeight >= scrollH - 4 && scrollH === lastScrollH) {
+        stable += 1;
+        if (stable >= 5) break;
+      } else {
+        stable = 0;
+      }
+      lastScrollH = scrollH;
+      if (i % 10 === 9) viewport.scrollTop = 0;
+    }
+
+    // 阶段2：按手动改法设高度（略加余量），并清 spacer padding
+    const finalH = Math.ceil(Math.max(maxH, 820) + 40);
+    viewport.style.maxHeight = `${finalH}px`;
+    viewport.style.height = `${finalH}px`;
+    viewport.style.overflowY = 'scroll';
+
+    const spacer = getSkuSpacer(viewport);
+    if (spacer) {
+      spacer.style.paddingTop = '0px';
+      spacer.style.paddingBottom = '0px';
+    }
+
+    viewport.scrollTop = 0;
+    await sleep(120);
+    // 高度够大后通常会挂载全部行；再滚一次兜底
+    viewport.scrollTop = viewport.scrollHeight;
+    await sleep(80);
+    maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+    if (maxH + 40 > finalH) {
+      const bigger = Math.ceil(maxH + 40);
+      viewport.style.maxHeight = `${bigger}px`;
+      viewport.style.height = `${bigger}px`;
+    }
+    if (spacer) {
+      spacer.style.paddingTop = '0px';
+      spacer.style.paddingBottom = '0px';
+    }
+    viewport.scrollTop = 0;
+    viewport.dataset.pcSkuExpanded = '1';
+  }
+
+  let skuExpandTimer = null;
+  let skuExpandRunning = false;
+
+  function scheduleSkuTableExpand() {
+    if (skuExpandTimer) clearTimeout(skuExpandTimer);
+    skuExpandTimer = setTimeout(async () => {
+      if (skuExpandRunning) return;
+      const viewport = getSkuScrollViewport();
+      if (!viewport) return;
+      skuExpandRunning = true;
+      try {
+        await loadAllVirtualSkuRows();
+      } finally {
+        skuExpandRunning = false;
+      }
+    }, 400);
+  }
+
+  /** 页面加载完成后自动展开虚拟 SKU 表格 */
+  function initSkuTableExpandOnLoad() {
+    const run = () => scheduleSkuTableExpand();
+    run();
+    [1000, 2500, 5000, 10000].forEach((ms) => setTimeout(run, ms));
+    if (document.readyState !== 'complete') {
+      window.addEventListener('load', run, { once: true });
+    }
+
+    const observer = new MutationObserver(() => {
+      if (getSkuScrollViewport() && !skuExpandRunning) scheduleSkuTableExpand();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   function round2(n) {
@@ -323,13 +488,15 @@
     if (!cols) return [];
 
     const bodyRows = container.querySelectorAll(
-      '[data-testid="beast-core-table-body-tr"], tbody tr',
+      'tbody tr[class*="TB_tr"], [data-testid="beast-core-table-body-tr"], tbody tr',
     );
     return extractSkuRowsFromBody(cols, bodyRows);
   }
 
   function collectSkuContainers() {
     const selectors = [
+      '#sku',
+      '#goods-spec-sku',
       '[data-e2e-id="e2e-sku-table"]',
       '.sku-list',
       '[data-testid="beast-core-table"]',
@@ -802,7 +969,7 @@
       document.documentElement.appendChild(style);
     }
     style.textContent = `
-      #${ROOT_ID} { --pc-r-col-w: 108px; --pc-style-col-w: 160px; }
+      #${ROOT_ID} { --pc-r-col-w: 108px; --pc-style-col-w: 160px; --pc-idx-col-w: 48px; }
       #${ROOT_ID} * { box-sizing: border-box; }
       #${ROOT_ID} .pc-fab {
         position: fixed; right: 16px; bottom: 72px; left: auto; top: auto;
@@ -846,8 +1013,13 @@
         width: 72px; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;
       }
       #${ROOT_ID} .pc-table input:read-only { background: #f3f4f6; color: #374151; }
+      #${ROOT_ID} .pc-sticky-idx {
+        position: sticky; left: 0; z-index: 3;
+        width: var(--pc-idx-col-w); min-width: var(--pc-idx-col-w); max-width: var(--pc-idx-col-w);
+        text-align: center; background: #fff; color: #6b7280; font-weight: 600;
+      }
       #${ROOT_ID} .pc-sticky-1 {
-        position: sticky; left: 0; z-index: 2;
+        position: sticky; left: var(--pc-idx-col-w); z-index: 2;
         width: var(--pc-style-col-w); min-width: var(--pc-style-col-w); max-width: var(--pc-style-col-w);
         background: #fff;
       }
@@ -873,8 +1045,10 @@
         width: var(--pc-r-col-w); min-width: var(--pc-r-col-w); max-width: var(--pc-r-col-w);
         box-shadow: -2px 0 4px rgba(0,0,0,.06); background: #fff;
       }
+      #${ROOT_ID} .pc-table th.pc-sticky-idx { background: #f9fafb; z-index: 8; }
       #${ROOT_ID} .pc-table th.pc-sticky-1 { background: #f9fafb; z-index: 7; }
       #${ROOT_ID} .pc-table th.pc-sticky-r-panel { z-index: 6; }
+      #${ROOT_ID} .pc-table td.pc-sticky-idx,
       #${ROOT_ID} .pc-table td.pc-sticky-1, #${ROOT_ID} .pc-table td.pc-sticky-r1,
       #${ROOT_ID} .pc-table td.pc-sticky-r2, #${ROOT_ID} .pc-table td.pc-sticky-r3 { background: #fff; }
       #${ROOT_ID} .pc-table td.pc-style-cell {
@@ -1221,8 +1395,12 @@
 
   function renderDataRows(tbody) {
     tbody.innerHTML = '';
-    rows.forEach((row) => {
+    rows.forEach((row, index) => {
       const tr = document.createElement('tr');
+
+      const tdIndex = document.createElement('td');
+      tdIndex.className = 'pc-sticky-idx';
+      tdIndex.textContent = String(index + 1);
 
       const tdStyle = document.createElement('td');
       tdStyle.className = 'pc-sticky-1 pc-style-cell';
@@ -1284,6 +1462,7 @@
       const tdGroup = createReadonlyTd(formatNum(row.groupPrice), 'pc-sticky-r2 pc-result');
       const tdSingle = createReadonlyTd(formatNum(row.singlePrice), 'pc-sticky-r1 pc-result');
 
+      tr.appendChild(tdIndex);
       tr.appendChild(tdStyle);
       tr.appendChild(tdCost);
       tr.appendChild(tdFreight);
@@ -1408,8 +1587,17 @@
     return th;
   }
 
-  function openPanel() {
+  async function openPanel() {
     const root = ensureRoot();
+    root.innerHTML = '';
+
+    const loading = document.createElement('div');
+    loading.className = 'pc-overlay';
+    loading.innerHTML = '<div class="pc-panel" style="padding:24px;text-align:center;color:#374151">正在加载 SKU 列表...</div>';
+    root.appendChild(loading);
+
+    await loadAllVirtualSkuRows();
+
     root.innerHTML = '';
 
     globalActivities = createDefaultActivities();
@@ -1427,7 +1615,7 @@
     const title = document.createElement('h2');
     const { goodsId, goodsTitle } = getGoodsMeta();
     title.textContent = rows.length > 0
-      ? `${goodsId}-${goodsTitle}`
+      ? `${goodsId}-${goodsTitle}（共 ${rows.length} 个 SKU）`
       : `${goodsId}-${goodsTitle}（未找到 SKU 表格）`;
     title.title = title.textContent;
 
@@ -1473,6 +1661,7 @@
       const thead = document.createElement('thead');
       const headRow1 = document.createElement('tr');
 
+      headRow1.appendChild(createSimpleHeaderTh('序号', 'pc-sticky-idx'));
       headRow1.appendChild(createSimpleHeaderTh('款式', 'pc-sticky-1 pc-style-head'));
       headRow1.appendChild(createColumnHeaderTh('采购成本（元）', 'cost', null, { min: 0, placeholder: '元' }));
       headRow1.appendChild(createColumnHeaderTh('运费（元）', 'freight', null, { min: 0, placeholder: '元' }));
@@ -1632,5 +1821,6 @@
   }
 
   selfTestFormulas();
+  initSkuTableExpandOnLoad();
   createFab();
 })();

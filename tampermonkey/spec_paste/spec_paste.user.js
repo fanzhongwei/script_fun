@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         规格名称批量粘贴
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.0.10
+// @version      1.1.0
 // @description  拼多多商家后台商品规格编辑页：在第一个规格名称框粘贴多值，自动拆分并依次填充
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -51,12 +51,69 @@
     return group.length > 0 && group[0] === input;
   }
 
-  function parseSpecNames(text) {
+  function getAllSpecGroupRoots() {
+    const roots = [];
+    const seen = new Set();
+    [...document.querySelectorAll(SPEC_INPUT_SELECTOR)].forEach((input) => {
+      if (!isFirstSpecInput(input)) return;
+      const root = findGroupRoot(input);
+      if (seen.has(root)) return;
+      seen.add(root);
+      roots.push(root);
+    });
+    return roots;
+  }
+
+  function getGroupColumnIndex(firstInput) {
+    const root = findGroupRoot(firstInput);
+    const idx = getAllSpecGroupRoots().indexOf(root);
+    return idx >= 0 ? idx : 0;
+  }
+
+  function parseTextRows(text) {
     return String(text || '')
       .replace(/^\uFEFF/, '')
-      .split(PASTE_SPLIT)
-      .map((s) => s.trim())
+      .split(/\r?\n/)
+      .map((line) => line.trim())
       .filter(Boolean);
+  }
+
+  function dedupeOrdered(values) {
+    const seen = new Set();
+    const result = [];
+    values.forEach((v) => {
+      const key = String(v).trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      result.push(key);
+    });
+    return result;
+  }
+
+  /** 多列 Tab 表格：取当前规格组对应列并按首次出现顺序去重；单列/单行仍兼容旧分隔符 */
+  function parseSpecNames(text, columnIndex) {
+    const lines = parseTextRows(text);
+    if (lines.length === 0) return [];
+
+    const hasTabs = lines.some((line) => line.includes('\t'));
+    if (hasTabs) {
+      const col = columnIndex >= 0 ? columnIndex : 0;
+      const values = lines
+        .map((line) => {
+          const parts = line.split('\t').map((s) => s.trim());
+          return parts[col] || '';
+        })
+        .filter(Boolean);
+      return dedupeOrdered(values);
+    }
+
+    if (lines.length > 1) {
+      return dedupeOrdered(lines);
+    }
+
+    return dedupeOrdered(
+      lines[0].split(PASTE_SPLIT).map((s) => s.trim()).filter(Boolean),
+    );
   }
 
   function setInputValue(input, value) {
@@ -200,7 +257,8 @@
   }
 
   async function handlePaste(firstInput, text) {
-    const names = parseSpecNames(text);
+    const columnIndex = getGroupColumnIndex(firstInput);
+    const names = parseSpecNames(text, columnIndex);
     if (names.length === 0) {
       showToast('未识别到有效规格名称');
       return;
