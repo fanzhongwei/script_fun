@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.5.5
+// @version      1.5.6
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -48,6 +48,10 @@
   let globalActivities = createDefaultActivities();
 
   let suppressCostInput = false;
+  const FILL_BATCH_SIZE = 12;
+  let fillBackRunning = false;
+  /** @type {HTMLButtonElement|null} */
+  let fillBtnRef = null;
 
   /** @typedef {{ style: string, groupInput: HTMLInputElement, singleInput: HTMLInputElement, rowIndex: number, cost: string, freight: number, returnRate: number, targetMargin: number, platformFee: number, singleRandomOffset: number, actualCost: number|null, actualGroupPrice: number|null, groupPrice: number|null, singlePrice: number|null, actualProfit: number|null, marginRate: number|null, netBreakEvenRoi: number|null, microPaidRoi: number|null, optimalRoi: number|null }} SkuRow */
 
@@ -930,29 +934,70 @@
     return true;
   }
 
-  function fillBackAll() {
+  async function fillBackAll() {
+    if (fillBackRunning) return;
+    fillBackRunning = true;
+    if (fillBtnRef) {
+      fillBtnRef.disabled = true;
+      fillBtnRef.textContent = '回填中…';
+    }
+
     let success = 0;
     let skipped = 0;
     let fail = 0;
-
+    /** @type {SkuRow[]} */
+    const targets = [];
     rows.forEach((row) => {
       if (row.groupPrice == null || row.singlePrice == null) {
         skipped += 1;
         return;
       }
-      try {
-        const styleOk = row.groupInput.closest('tr')?.textContent?.includes(row.style.slice(0, 8));
-        if (styleOk === false) fail += 1;
-        const gOk = setInputValue(row.groupInput, row.groupPrice.toFixed(2));
-        const sOk = row.singleInput ? setInputValue(row.singleInput, row.singlePrice.toFixed(2)) : true;
-        if (gOk && sOk) success += 1;
-        else fail += 1;
-      } catch {
-        fail += 1;
-      }
+      targets.push(row);
     });
 
-    showNotice(`回填完成：成功 ${success} 行，跳过 ${skipped} 行，失败 ${fail} 行`);
+    try {
+      const total = targets.length;
+      if (total === 0) {
+        showNotice(`回填完成：成功 0 行，跳过 ${skipped} 行，失败 0 行`);
+        return;
+      }
+
+      for (let i = 0; i < targets.length; i += FILL_BATCH_SIZE) {
+        const batch = targets.slice(i, i + FILL_BATCH_SIZE);
+        batch.forEach((row) => {
+          try {
+            if (!row.groupInput || !row.groupInput.isConnected) {
+              fail += 1;
+              return;
+            }
+            if (row.singleInput && !row.singleInput.isConnected) {
+              fail += 1;
+              return;
+            }
+            const gOk = setInputValue(row.groupInput, row.groupPrice.toFixed(2));
+            const sOk = row.singleInput
+              ? setInputValue(row.singleInput, row.singlePrice.toFixed(2))
+              : true;
+            if (gOk && sOk) success += 1;
+            else fail += 1;
+          } catch {
+            fail += 1;
+          }
+        });
+        const done = Math.min(i + FILL_BATCH_SIZE, total);
+        showNotice(`回填中 ${done}/${total}…`);
+        await sleep(0);
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      }
+
+      showNotice(`回填完成：成功 ${success} 行，跳过 ${skipped} 行，失败 ${fail} 行`);
+    } finally {
+      fillBackRunning = false;
+      if (fillBtnRef) {
+        fillBtnRef.disabled = false;
+        fillBtnRef.textContent = '回填';
+      }
+    }
   }
 
   function recalcAllRows() {
@@ -1095,7 +1140,8 @@
         margin-top: 4px; width: 100%; padding: 6px 10px; border: none; border-radius: 6px;
         background: #2563eb; color: #fff; cursor: pointer; font-size: 13px;
       }
-      #${ROOT_ID} .pc-fill-btn:hover { background: #1d4ed8; }
+      #${ROOT_ID} .pc-fill-btn:hover:not(:disabled) { background: #1d4ed8; }
+      #${ROOT_ID} .pc-fill-btn:disabled { opacity: .65; cursor: not-allowed; }
       #${ROOT_ID} .pc-import-layer {
         position: fixed; inset: 0; z-index: 2147483649;
         background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center;
@@ -1567,7 +1613,8 @@
     fillBtn.type = 'button';
     fillBtn.className = 'pc-fill-btn';
     fillBtn.textContent = '回填';
-    fillBtn.addEventListener('click', fillBackAll);
+    fillBtn.addEventListener('click', () => { fillBackAll(); });
+    fillBtnRef = fillBtn;
     grid.appendChild(fillBtn);
 
     const subheads = document.createElement('div');
