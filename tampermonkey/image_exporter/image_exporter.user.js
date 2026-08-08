@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.3.9
+// @version      1.4.0
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -53,6 +53,7 @@
     return cleaned || fallback;
   }
 
+  const PREVIEW_CHUNK_SIZE = 12;
   const FOLDER_PRESETS = ['轮播图', '详情图', '预览图'];
   const PDD_CATEGORY_ORDER = ['category:carousel', 'category:detail', 'category:preview'];
   const PDD_CATEGORIES = [
@@ -457,6 +458,55 @@
     return groups;
   }
 
+  function getPreviewItems() {
+    return images.filter((item) => item.moduleKey === 'category:preview');
+  }
+
+  /** 预览图在类目内的 1-based 序号（与 DOM 采集顺序一致） */
+  function getPreviewGlobalIndex(item) {
+    const previewItems = getPreviewItems();
+    const idx = previewItems.findIndex((i) => i.id === item.id);
+    return idx >= 0 ? idx + 1 : 1;
+  }
+
+  function previewChunkFolderName(globalIndex, totalPreview) {
+    const chunkStart = Math.floor((globalIndex - 1) / PREVIEW_CHUNK_SIZE) * PREVIEW_CHUNK_SIZE + 1;
+    const chunkEnd = Math.min(chunkStart + PREVIEW_CHUNK_SIZE - 1, totalPreview);
+    return `${chunkStart}-${chunkEnd}`;
+  }
+
+  function buildPreviewDownloadTasks(items, baseFolder) {
+    const totalPreview = getPreviewItems().length;
+    const sorted = [...items].sort(
+      (a, b) => getPreviewGlobalIndex(a) - getPreviewGlobalIndex(b),
+    );
+    return sorted.map((item) => {
+      const globalIndex = getPreviewGlobalIndex(item);
+      const filename = `${globalIndex}${guessExtension(item.url)}`;
+      if (totalPreview <= PREVIEW_CHUNK_SIZE) {
+        return { url: item.url, name: `${baseFolder}/${filename}` };
+      }
+      const subFolder = previewChunkFolderName(globalIndex, totalPreview);
+      return { url: item.url, name: `${baseFolder}/${subFolder}/${filename}` };
+    });
+  }
+
+  function buildDownloadTasksFromBatches(batches) {
+    const tasks = [];
+    batches.forEach(({ folder, items }) => {
+      if (!folder || !items.length) return;
+      const isPreview = items.every((item) => item.moduleKey === 'category:preview');
+      if (isPreview) {
+        tasks.push(...buildPreviewDownloadTasks(items, folder));
+        return;
+      }
+      buildOrderedFilenames(items).forEach((file) => {
+        tasks.push({ url: file.url, name: `${folder}/${file.filename}` });
+      });
+    });
+    return tasks;
+  }
+
   function downloadItems(items, folder, triggerBtn) {
     downloadItemsMulti([{ folder, items }], triggerBtn);
   }
@@ -477,13 +527,7 @@
   }
 
   function downloadItemsMulti(batches, triggerBtn) {
-    const tasks = [];
-    batches.forEach(({ folder, items }) => {
-      if (!folder || !items.length) return;
-      buildOrderedFilenames(items).forEach((file) => {
-        tasks.push({ url: file.url, name: `${folder}/${file.filename}` });
-      });
-    });
+    const tasks = buildDownloadTasksFromBatches(batches);
 
     if (!tasks.length) {
       showToast('没有可下载的图片');
@@ -501,8 +545,13 @@
       pending -= 1;
       if (pending === 0) {
         if (triggerBtn) triggerBtn.disabled = false;
-        const folders = [...new Set(batches.map((b) => b.folder))];
-        const folderHint = folders.length === 1 ? folders[0] : folders.join('、');
+        const folderPaths = [...new Set(tasks.map((t) => {
+          const slash = t.name.lastIndexOf('/');
+          return slash > 0 ? t.name.slice(0, slash) : t.name;
+        }))];
+        const folderHint = folderPaths.length <= 3
+          ? folderPaths.join('、')
+          : `${folderPaths.slice(0, 2).join('、')} 等 ${folderPaths.length} 个目录`;
         showToast(`下载完成：成功 ${success} 张，失败 ${fail} 张 → ${folderHint}`);
       }
     };
@@ -709,7 +758,7 @@
         padding: 16px 20px; min-height: 56px; box-sizing: border-box;
         border-bottom: 1px solid #e5e7eb;
         display: flex; flex-wrap: nowrap; gap: 10px; align-items: center;
-        overflow-x: auto;
+        overflow-x: auto; overflow-y: hidden;
       }
       #${ROOT_ID} .pie-header h2 {
         margin: 0; font-size: 16px; font-weight: 600; flex: 0 0 auto; white-space: nowrap;
