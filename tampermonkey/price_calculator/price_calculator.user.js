@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.5.6
+// @version      1.6.4
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -48,7 +48,11 @@
   let globalActivities = createDefaultActivities();
 
   let suppressCostInput = false;
-  const FILL_BATCH_SIZE = 12;
+  /** SKU 行高（px），用于虚拟表展开高度：count × 行高 */
+  const SKU_ROW_HEIGHT_PX = 70;
+  /** 事件回填兜底：每批行数与让出间隔 */
+  const FILL_BATCH_SIZE = 1;
+  const FILL_YIELD_MS = 80;
   let fillBackRunning = false;
   /** @type {HTMLButtonElement|null} */
   let fillBtnRef = null;
@@ -111,36 +115,63 @@
     return table ? table.parentElement : null;
   }
 
-  /** 虚拟总高度 = paddingTop + 当前行总高 + paddingBottom（与手动改 11820px 同源） */
+  function clearSkuSpacer(viewport) {
+    const spacer = getSkuSpacer(viewport);
+    if (!spacer) return;
+    spacer.style.paddingTop = '0px';
+    spacer.style.paddingBottom = '0px';
+  }
+
+  /** 虚拟总高度 = paddingTop + 行高 + paddingBottom（滚动测量用） */
   function measureVirtualContentHeight(viewport) {
     const spacer = getSkuSpacer(viewport);
     const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
-    const rows = table.querySelectorAll(SKU_ROW_IN_TABLE);
+    const trs = table.querySelectorAll(SKU_ROW_IN_TABLE);
     let rowsH = 0;
-    rows.forEach((row) => { rowsH += row.getBoundingClientRect().height || 0; });
-    if (rowsH < 1 && rows.length > 0) rowsH = rows.length * 69;
+    trs.forEach((row) => { rowsH += row.getBoundingClientRect().height || 0; });
+    if (rowsH < 1 && trs.length > 0) rowsH = trs.length * SKU_ROW_HEIGHT_PX;
 
     const pt = spacer ? (parseFloat(spacer.style.paddingTop) || 0) : 0;
     const pb = spacer ? (parseFloat(spacer.style.paddingBottom) || 0) : 0;
     return Math.max(pt + rowsH + pb, viewport.scrollHeight, table.scrollHeight || 0, rowsH);
   }
 
+  /** 优先 React tableList 长度，其次已扫描 rows / 当前 DOM 行数 */
+  function getSkuCountHint() {
+    try {
+      const inst = findSkuBatchInstance();
+      if (inst?.props?.sku?.tableList?.length) return inst.props.sku.tableList.length;
+    } catch {
+      /* ignore */
+    }
+    if (rows.length > 0) return rows.length;
+    const viewport = getSkuScrollViewport();
+    if (!viewport) return 0;
+    return viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
+  }
+
   /**
-   * 对齐手动改法：
-   * viewport.style = max-height/height = 总高度; overflow-y: scroll
-   * spacer.style   = padding-top/bottom = 0
+   * 展开虚拟 SKU 表（初始化/刷新用）：
+   * 1) 先在 820px 高度下反复滚到底，唤醒虚拟列表并测量
+   * 2) 再把高度设为 tableList 数量×70（无数量时用测量值），并清 spacer
+   * 注意：只改高度不清滚动挂载，会出现「只有几行 + 大片空白」
    */
   async function loadAllVirtualSkuRows() {
     const viewport = getSkuScrollViewport();
     if (!viewport) return;
 
+    const countHint = getSkuCountHint();
     if (viewport.dataset.pcSkuExpanded === '1') {
-      const rows = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
-      if (rows > 0 && viewport.clientHeight >= measureVirtualContentHeight(viewport) - 4) return;
+      const mounted = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
+      if (countHint > 0 && mounted >= countHint) return;
+      if (countHint < 1 && mounted > 0
+        && viewport.clientHeight >= measureVirtualContentHeight(viewport) - 4) {
+        return;
+      }
     }
     delete viewport.dataset.pcSkuExpanded;
 
-    // 阶段1：保持可滚动，滚到底测虚拟总高
+    // 阶段1：保持可滚动，滚到底唤醒虚拟列表
     viewport.style.maxHeight = '820px';
     viewport.style.height = '820px';
     viewport.style.overflowY = 'scroll';
@@ -163,35 +194,150 @@
       if (i % 10 === 9) viewport.scrollTop = 0;
     }
 
-    // 阶段2：按手动改法设高度（略加余量），并清 spacer padding
-    const finalH = Math.ceil(Math.max(maxH, 820) + 40);
+    // 阶段2：有 tableList/扫描数量时用 N×70；否则用滚动测量值
+    const count = getSkuCountHint();
+    const mounted = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
+    const n = count > 0 ? count : Math.max(mounted, 1);
+    const byCount = n * SKU_ROW_HEIGHT_PX;
+    let finalH = count > 0
+      ? Math.ceil(Math.max(byCount, 820) + 40)
+      : Math.ceil(Math.max(maxH, byCount, 820) + 40);
+
     viewport.style.maxHeight = `${finalH}px`;
     viewport.style.height = `${finalH}px`;
     viewport.style.overflowY = 'scroll';
-
-    const spacer = getSkuSpacer(viewport);
-    if (spacer) {
-      spacer.style.paddingTop = '0px';
-      spacer.style.paddingBottom = '0px';
-    }
+    clearSkuSpacer(viewport);
 
     viewport.scrollTop = 0;
     await sleep(120);
-    // 高度够大后通常会挂载全部行；再滚一次兜底
     viewport.scrollTop = viewport.scrollHeight;
     await sleep(80);
-    maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
-    if (maxH + 40 > finalH) {
-      const bigger = Math.ceil(maxH + 40);
-      viewport.style.maxHeight = `${bigger}px`;
-      viewport.style.height = `${bigger}px`;
+    clearSkuSpacer(viewport);
+
+    if (count < 1) {
+      maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+      if (maxH + 40 > finalH) {
+        finalH = Math.ceil(maxH + 40);
+        viewport.style.maxHeight = `${finalH}px`;
+        viewport.style.height = `${finalH}px`;
+      }
+      clearSkuSpacer(viewport);
     }
-    if (spacer) {
-      spacer.style.paddingTop = '0px';
-      spacer.style.paddingBottom = '0px';
-    }
+
     viewport.scrollTop = 0;
+    clearSkuSpacer(viewport);
     viewport.dataset.pcSkuExpanded = '1';
+  }
+
+  /** 回填写入 tableList 后点击页脚「保存草稿」，让后台提交模型中的新价格 */
+  function clickSaveDraftButton() {
+    const footer = document.querySelector('#goods_create .goods-footer-main')
+      || document.querySelector('.goods-footer-main');
+    if (!footer) return false;
+    const btn = [...footer.querySelectorAll('button, [role="button"], a, span')].find((el) => {
+      const text = (el.textContent || '').replace(/\s+/g, '');
+      return text === '保存草稿' || /^保存草稿/.test(text);
+    });
+    if (!btn) return false;
+    const clickable = btn.closest('button') || btn;
+    clickable.click();
+    return true;
+  }
+
+  function findReactFiber(el) {
+    if (!el) return null;
+    const key = Object.keys(el).find(
+      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
+    );
+    return key ? el[key] : null;
+  }
+
+  /** 定位带 props.sku.tableList 的批量设置组件实例 */
+  function findSkuBatchInstance() {
+    const wrap = document.querySelector('#sku .batch-wrap')
+      || document.querySelector('.sku-batch .batch-wrap')
+      || document.querySelector('[data-testid="batch-set"]')
+      || document.querySelector('.batch-wrap');
+    if (!wrap) return null;
+    const btn = [...wrap.querySelectorAll('button')].find((el) => /批量设置/.test(el.textContent || ''));
+    let fiber = findReactFiber(btn) || findReactFiber(wrap);
+    for (let i = 0; i < 40 && fiber; i += 1, fiber = fiber.return) {
+      const node = fiber.stateNode;
+      if (node && node.props && node.props.sku && Array.isArray(node.props.sku.tableList)) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  function normalizeStyleKey(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function styleKeyFromSpec(spec) {
+    if (!Array.isArray(spec)) return '';
+    return normalizeStyleKey(spec
+      .map((s) => (s && (s.v_value || s.spec_value || s.value || s.spec_name || '')) || '')
+      .map((t) => String(t).trim())
+      .filter(Boolean)
+      .join(' / '));
+  }
+
+  function yuanToFen(yuan) {
+    return Math.round(Number(yuan) * 100);
+  }
+
+  /**
+   * 通过 React sku.tableList 批量写价格（分）。
+   * @returns {{ success: number, fail: number, count: number } | null}
+   */
+  function fillBackViaTableList(targets) {
+    const inst = findSkuBatchInstance();
+    const srcList = inst?.props?.sku?.tableList;
+    if (!inst || !Array.isArray(srcList) || srcList.length === 0) return null;
+
+    const list = JSON.parse(JSON.stringify(srcList));
+    /** @type {Map<string, number>} */
+    const indexByStyle = new Map();
+    list.forEach((item, idx) => {
+      const key = styleKeyFromSpec(item.spec);
+      if (key && !indexByStyle.has(key)) indexByStyle.set(key, idx);
+    });
+
+    let success = 0;
+    let fail = 0;
+    const allowIndexFallback = list.length === rows.length || list.length === targets.length;
+    targets.forEach((row, targetIdx) => {
+      let idx = indexByStyle.get(normalizeStyleKey(row.style));
+      if (idx == null && allowIndexFallback) {
+        if (row.rowIndex >= 0 && row.rowIndex < list.length) idx = row.rowIndex;
+        else if (targetIdx < list.length) idx = targetIdx;
+      }
+      if (idx == null) {
+        fail += 1;
+        return;
+      }
+      list[idx].multi_price = yuanToFen(row.groupPrice);
+      list[idx].price = yuanToFen(row.singlePrice);
+      list[idx].multi_price_in_yuan = null;
+      list[idx].price_in_yuan = null;
+      list[idx].forceUpdate = true;
+      success += 1;
+    });
+
+    inst.props.sku.tableList = list;
+    try {
+      if (typeof inst.forceUpdate === 'function') inst.forceUpdate();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (typeof inst.setState === 'function') inst.setState({ __pcFillTick: Date.now() });
+    } catch {
+      /* ignore */
+    }
+
+    return { success, fail, count: list.length };
   }
 
   let skuExpandTimer = null;
@@ -925,13 +1071,49 @@
     }
   }
 
-  function setInputValue(input, value) {
+  function setInputValue(input, value, options = {}) {
     if (!input) return false;
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
     setter.call(input, String(value));
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+    if (!options.silent) {
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     return true;
+  }
+
+  async function fillBackByInputEvents(targets, skipped) {
+    let success = 0;
+    let fail = 0;
+    const total = targets.length;
+    showNotice(`回填中 0/${total}…（事件兜底）`);
+
+    for (let i = 0; i < targets.length; i += FILL_BATCH_SIZE) {
+      const batch = targets.slice(i, i + FILL_BATCH_SIZE);
+      for (const row of batch) {
+        try {
+          if (!row.groupInput || !row.groupInput.isConnected) {
+            fail += 1;
+          } else if (row.singleInput && !row.singleInput.isConnected) {
+            fail += 1;
+          } else {
+            const gOk = setInputValue(row.groupInput, row.groupPrice.toFixed(2));
+            await sleep(FILL_YIELD_MS);
+            const sOk = row.singleInput
+              ? setInputValue(row.singleInput, row.singlePrice.toFixed(2))
+              : true;
+            if (gOk && sOk) success += 1;
+            else fail += 1;
+          }
+        } catch {
+          fail += 1;
+        }
+      }
+      const done = Math.min(i + FILL_BATCH_SIZE, total);
+      showNotice(`回填中 ${done}/${total}…（事件兜底）`);
+      await sleep(FILL_YIELD_MS);
+    }
+
+    showNotice(`回填完成：成功 ${success} 行，跳过 ${skipped} 行，失败 ${fail} 行`);
   }
 
   async function fillBackAll() {
@@ -942,9 +1124,7 @@
       fillBtnRef.textContent = '回填中…';
     }
 
-    let success = 0;
     let skipped = 0;
-    let fail = 0;
     /** @type {SkuRow[]} */
     const targets = [];
     rows.forEach((row) => {
@@ -956,41 +1136,30 @@
     });
 
     try {
-      const total = targets.length;
-      if (total === 0) {
+      if (targets.length === 0) {
         showNotice(`回填完成：成功 0 行，跳过 ${skipped} 行，失败 0 行`);
         return;
       }
 
-      for (let i = 0; i < targets.length; i += FILL_BATCH_SIZE) {
-        const batch = targets.slice(i, i + FILL_BATCH_SIZE);
-        batch.forEach((row) => {
-          try {
-            if (!row.groupInput || !row.groupInput.isConnected) {
-              fail += 1;
-              return;
-            }
-            if (row.singleInput && !row.singleInput.isConnected) {
-              fail += 1;
-              return;
-            }
-            const gOk = setInputValue(row.groupInput, row.groupPrice.toFixed(2));
-            const sOk = row.singleInput
-              ? setInputValue(row.singleInput, row.singlePrice.toFixed(2))
-              : true;
-            if (gOk && sOk) success += 1;
-            else fail += 1;
-          } catch {
-            fail += 1;
-          }
-        });
-        const done = Math.min(i + FILL_BATCH_SIZE, total);
-        showNotice(`回填中 ${done}/${total}…`);
-        await sleep(0);
-        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      showNotice(`回填中：写入 tableList（${targets.length} 行）…`);
+      const bulk = fillBackViaTableList(targets);
+      if (bulk && bulk.success > 0) {
+        showNotice(`回填中：已写入 ${bulk.success} 行，正在保存草稿…`);
+        await sleep(80);
+        const saved = clickSaveDraftButton();
+        showNotice(
+          `回填完成：成功 ${bulk.success} 行，跳过 ${skipped} 行，失败 ${bulk.fail} 行`
+          + `（tableList${saved ? '，已点保存草稿' : '，未找到保存草稿按钮'}）`,
+        );
+        return;
       }
 
-      showNotice(`回填完成：成功 ${success} 行，跳过 ${skipped} 行，失败 ${fail} 行`);
+      showNotice('未命中 tableList，改用逐行事件回填…');
+      await fillBackByInputEvents(targets, skipped);
+      await sleep(80);
+      if (clickSaveDraftButton()) {
+        showNotice('事件回填结束，已点保存草稿');
+      }
     } finally {
       fillBackRunning = false;
       if (fillBtnRef) {
