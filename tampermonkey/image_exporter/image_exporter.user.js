@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.5.0
+// @version      1.5.1
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -563,8 +563,8 @@
   }
 
   /**
-   * 构建下载任务：按本次下载列表的 DOM 顺序编号 1,2,3…（与 badge 一致）
-   * 本次下载 >12 张时：{folder}/1/1.jpg … {folder}/2/1.jpg …
+   * 构建下载任务：按类目内 DOM 顺序全局连续编号 1,2,3…
+   * 类目总数 >12 张时：{folder}/1-12/1.jpg … {folder}/13-24/13.jpg …
    */
   function splitFolderPath(baseFolder) {
     return String(baseFolder || '')
@@ -573,24 +573,45 @@
       .filter(Boolean);
   }
 
+  function getCategoryTotal(moduleKey) {
+    if (!moduleKey) return 0;
+    return images.filter((item) => item.moduleKey === moduleKey).length;
+  }
+
+  /** 图片在所属类目完整列表中的 1-based 序号（部分选中时仍按完整列表位置） */
+  function getCategoryPosition(item) {
+    if (!item?.moduleKey) return 0;
+    const allInCategory = images
+      .filter((img) => img.moduleKey === item.moduleKey)
+      .sort((a, b) => a.order - b.order);
+    const idx = allInCategory.findIndex((img) => img.id === item.id);
+    return idx >= 0 ? idx + 1 : 0;
+  }
+
+  /** 全局序号所在分桶目录名，如 1-12、13-24 */
+  function chunkRangeLabel(seq) {
+    const start = Math.floor((seq - 1) / CHUNK_SIZE) * CHUNK_SIZE + 1;
+    const end = start + CHUNK_SIZE - 1;
+    return `${start}-${end}`;
+  }
+
   function buildCategoryDownloadTasks(items, baseFolder) {
     const sorted = sortByDomOrder(items);
     const folderParts = splitFolderPath(baseFolder);
     if (!folderParts.length) folderParts.push('images');
-    const count = sorted.length;
-    const useChunks = count > CHUNK_SIZE;
+    const moduleKey = sorted[0]?.moduleKey;
+    const categoryTotal = moduleKey ? getCategoryTotal(moduleKey) : sorted.length;
+    const useChunks = categoryTotal > CHUNK_SIZE;
 
     return sorted.map((item, index) => {
-      const seq = index + 1;
+      const seq = getCategoryPosition(item) || index + 1;
       const ext = guessExtension(item.url);
       if (!useChunks) {
         return { url: item.url, name: joinDownloadPath(...folderParts, `${seq}${ext}`) };
       }
-      const chunkFolder = Math.floor(index / CHUNK_SIZE) + 1;
-      const nameInChunk = (index % CHUNK_SIZE) + 1;
       return {
         url: item.url,
-        name: joinDownloadPath(...folderParts, chunkFolder, `${nameInChunk}${ext}`),
+        name: joinDownloadPath(...folderParts, chunkRangeLabel(seq), `${seq}${ext}`),
       };
     });
   }
