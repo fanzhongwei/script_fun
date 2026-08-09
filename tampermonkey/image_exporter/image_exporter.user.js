@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.4.0
+// @version      1.5.0
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -30,6 +33,12 @@
   let panelFolderInput = null;
   /** @type {(() => void) | null} */
   let panelSyncPresets = null;
+  /** @type {FileSystemDirectoryHandle | null} 本次面板会话内用户选择的保存根目录 */
+  let saveDirHandle = null;
+  /** @type {Map<string, FileSystemDirectoryHandle>} 写入目录缓存，避免重复 resolve */
+  let fsDirHandleCache = new Map();
+  /** @type {string|null} 拼多多页：{商品标题}-{商品ID} 外层目录名 */
+  let pddExportRoot = null;
 
   function isPddPresetCategory(moduleKey) {
     return PDD_CATEGORY_ORDER.includes(moduleKey);
@@ -53,8 +62,23 @@
     return cleaned || fallback;
   }
 
-  const PREVIEW_CHUNK_SIZE = 12;
+  /** GM_download 子路径：统一正斜杠，Win/Linux/macOS 兼容 */
+  function joinDownloadPath(...parts) {
+    return parts
+      .map((part) => sanitizePathPart(String(part), ''))
+      .filter(Boolean)
+      .join('/');
+  }
+
+  const CHUNK_SIZE = 12;
+  /** 并发下载数（FS API 写入可并行；GM_download 回退时自动降低） */
+  const DOWNLOAD_CONCURRENCY = 10;
+  const GM_DOWNLOAD_CONCURRENCY = 2;
+  const GM_DOWNLOAD_GAP_MS = 40;
+  const EXCEL_HOOK_SOURCE = 'pie-excel-hook';
+  const EXCEL_URL_RE = /excel|xlsx|export|sku|batch|glide|template|spec|edit|download|cost|mms/i;
   const FOLDER_PRESETS = ['轮播图', '详情图', '预览图'];
+  const SAVE_DIR_PICK_HINT = '请选择保存目录（建议选择 Downloads/下载 文件夹）…';
   const PDD_CATEGORY_ORDER = ['category:carousel', 'category:detail', 'category:preview'];
   const PDD_CATEGORIES = [
     { key: 'category:carousel', label: '轮播图' },
@@ -64,6 +88,68 @@
 
   function isPddMmsPage() {
     return /mms\.pinduoduo\.com/i.test(location.hostname);
+  }
+
+  /** 拼多多商品编辑页：读取标题 + 商品ID，拼成外层文件夹名 */
+  function getPddGoodsMeta() {
+    let goodsId = '';
+    const idWrap = document.querySelector('.goods-id-wrap');
+    if (idWrap) {
+      const m = (idWrap.textContent || '').match(/商品ID\s*[:：]\s*(\d+)/);
+      if (m) goodsId = m[1];
+    }
+
+    if (!goodsId) {
+      try {
+        const url = new URL(location.href);
+        for (const key of ['goods_id', 'id', 'goodsId']) {
+          const v = url.searchParams.get(key);
+          if (v) {
+            goodsId = v;
+            break;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    let goodsTitle = '';
+    const titleInput = document.querySelector('#basic\\.goods_name input[type="text"]');
+    if (titleInput?.value?.trim()) {
+      goodsTitle = titleInput.value.trim();
+    }
+    if (!goodsTitle) {
+      const titleWrap = document.querySelector('.edit-title-wrap');
+      if (titleWrap) {
+        goodsTitle = (titleWrap.textContent || '')
+          .replace(/商品ID\s*[:：]\s*\d+/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+    }
+    if (!goodsTitle) goodsTitle = '未命名商品';
+    if (!goodsId) goodsId = 'unknown';
+
+    return { goodsId, goodsTitle };
+  }
+
+  function resolvePddExportRoot() {
+    const { goodsTitle, goodsId } = getPddGoodsMeta();
+    return sanitizePathPart(`${goodsTitle}-${goodsId}`.slice(0, 120), '商品');
+  }
+
+  function getPddExportRootFolder() {
+    if (!isPddMmsPage()) return null;
+    if (!pddExportRoot) pddExportRoot = resolvePddExportRoot();
+    return pddExportRoot;
+  }
+
+  /** 拼多多类目下载路径：{标题-ID}/轮播图/… */
+  function withExportRoot(relativeFolder) {
+    const root = getPddExportRootFolder();
+    if (!root) return relativeFolder;
+    return joinDownloadPath(root, relativeFolder);
   }
 
   function firstBackgroundUrl(el) {
@@ -219,12 +305,22 @@
   }
 
   /** #detail_pic 商详快捷编辑详情图 */
+  function isDetailImagePlaceholder(img) {
+    let node = img;
+    for (let i = 0; i < 8 && node; i += 1, node = node.parentElement) {
+      const text = (node.textContent || '').replace(/\s+/g, '');
+      if (/文本暂无预览|暂无预览|无预览/.test(text)) return true;
+    }
+    return false;
+  }
+
   function collectDetailImages() {
     const root = document.querySelector('#detail_pic');
     if (!root || root.closest(`#${ROOT_ID}`)) return [];
 
     const urls = [];
     root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]').forEach((img) => {
+      if (isDetailImagePlaceholder(img)) return;
       const candidate = collectImgCandidates(img).map((raw) => toAbsoluteUrl(raw)).find(Boolean);
       if (candidate) urls.push(candidate);
     });
@@ -458,36 +554,44 @@
     return groups;
   }
 
-  function getPreviewItems() {
-    return images.filter((item) => item.moduleKey === 'category:preview');
+  function findItemById(id) {
+    return images.find((item) => item.id === id) || null;
   }
 
-  /** 预览图在类目内的 1-based 序号（与 DOM 采集顺序一致） */
-  function getPreviewGlobalIndex(item) {
-    const previewItems = getPreviewItems();
-    const idx = previewItems.findIndex((i) => i.id === item.id);
-    return idx >= 0 ? idx + 1 : 1;
+  function sortByDomOrder(items) {
+    return [...items].sort((a, b) => a.order - b.order);
   }
 
-  function previewChunkFolderName(globalIndex, totalPreview) {
-    const chunkStart = Math.floor((globalIndex - 1) / PREVIEW_CHUNK_SIZE) * PREVIEW_CHUNK_SIZE + 1;
-    const chunkEnd = Math.min(chunkStart + PREVIEW_CHUNK_SIZE - 1, totalPreview);
-    return `${chunkStart}-${chunkEnd}`;
+  /**
+   * 构建下载任务：按本次下载列表的 DOM 顺序编号 1,2,3…（与 badge 一致）
+   * 本次下载 >12 张时：{folder}/1/1.jpg … {folder}/2/1.jpg …
+   */
+  function splitFolderPath(baseFolder) {
+    return String(baseFolder || '')
+      .split('/')
+      .map((part) => sanitizePathPart(part, ''))
+      .filter(Boolean);
   }
 
-  function buildPreviewDownloadTasks(items, baseFolder) {
-    const totalPreview = getPreviewItems().length;
-    const sorted = [...items].sort(
-      (a, b) => getPreviewGlobalIndex(a) - getPreviewGlobalIndex(b),
-    );
-    return sorted.map((item) => {
-      const globalIndex = getPreviewGlobalIndex(item);
-      const filename = `${globalIndex}${guessExtension(item.url)}`;
-      if (totalPreview <= PREVIEW_CHUNK_SIZE) {
-        return { url: item.url, name: `${baseFolder}/${filename}` };
+  function buildCategoryDownloadTasks(items, baseFolder) {
+    const sorted = sortByDomOrder(items);
+    const folderParts = splitFolderPath(baseFolder);
+    if (!folderParts.length) folderParts.push('images');
+    const count = sorted.length;
+    const useChunks = count > CHUNK_SIZE;
+
+    return sorted.map((item, index) => {
+      const seq = index + 1;
+      const ext = guessExtension(item.url);
+      if (!useChunks) {
+        return { url: item.url, name: joinDownloadPath(...folderParts, `${seq}${ext}`) };
       }
-      const subFolder = previewChunkFolderName(globalIndex, totalPreview);
-      return { url: item.url, name: `${baseFolder}/${subFolder}/${filename}` };
+      const chunkFolder = Math.floor(index / CHUNK_SIZE) + 1;
+      const nameInChunk = (index % CHUNK_SIZE) + 1;
+      return {
+        url: item.url,
+        name: joinDownloadPath(...folderParts, chunkFolder, `${nameInChunk}${ext}`),
+      };
     });
   }
 
@@ -495,14 +599,7 @@
     const tasks = [];
     batches.forEach(({ folder, items }) => {
       if (!folder || !items.length) return;
-      const isPreview = items.every((item) => item.moduleKey === 'category:preview');
-      if (isPreview) {
-        tasks.push(...buildPreviewDownloadTasks(items, folder));
-        return;
-      }
-      buildOrderedFilenames(items).forEach((file) => {
-        tasks.push({ url: file.url, name: `${folder}/${file.filename}` });
-      });
+      tasks.push(...buildCategoryDownloadTasks(items, folder));
     });
     return tasks;
   }
@@ -517,7 +614,10 @@
     const otherSelected = selected.filter((item) => !isPddPresetCategory(item.moduleKey));
 
     groupImagesByModule(pddSelected).forEach((group) => {
-      batches.push({ folder: pddCategoryFolder(group.label), items: group.items });
+      batches.push({
+        folder: withExportRoot(pddCategoryFolder(group.label)),
+        items: group.items,
+      });
     });
 
     if (otherSelected.length > 0) {
@@ -526,68 +626,805 @@
     return batches;
   }
 
-  function downloadItemsMulti(batches, triggerBtn) {
-    const tasks = buildDownloadTasksFromBatches(batches);
+  function isFullPddExport(categoryKeys) {
+    return categoryKeys.length === PDD_CATEGORY_ORDER.length
+      && PDD_CATEGORY_ORDER.every((key, index) => categoryKeys[index] === key);
+  }
 
-    if (!tasks.length) {
-      showToast('没有可下载的图片');
+  function findReactFiber(el) {
+    if (!el) return null;
+    const key = Object.keys(el).find(
+      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
+    );
+    return key ? el[key] : null;
+  }
+
+  /** 定位「Excel批量编辑规格」入口 */
+  function findSkuExcelExportElement() {
+    const directLinks = document.querySelectorAll(
+      '#sku a[class*="BTN_outerWrapperLink"], #goods-spec-sku a[class*="BTN_outerWrapperLink"], ' +
+      '#sku a, #goods-spec-sku a',
+    );
+    for (const a of directLinks) {
+      if (a.closest(`#${ROOT_ID}`)) continue;
+      const text = (a.textContent || '').replace(/\s+/g, '');
+      if (/Excel批量编辑规格|Excel批量编辑|批量编辑规格/.test(text)) return a;
+    }
+
+    const scopes = [
+      document.querySelector('#sku .sku-top-right'),
+      document.querySelector('[class*="sku-top-right"]'),
+      document.querySelector('#sku'),
+      document.querySelector('#goods-spec-sku'),
+    ].filter((el) => el && !el.closest(`#${ROOT_ID}`));
+
+    for (const scope of scopes) {
+      const nodes = scope.querySelectorAll('a, button, span, [role="button"], [role="link"]');
+      for (const node of nodes) {
+        const text = (node.textContent || '').replace(/\s+/g, '');
+        if (/Excel批量编辑规格|Excel批量编辑|批量编辑规格/.test(text)) {
+          return node.closest('a, button, [role="button"]') || node;
+        }
+      }
+    }
+    return null;
+  }
+
+  function getUnsafeWindow() {
+    return typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  }
+
+  function setExcelCaptureActive(active) {
+    getUnsafeWindow().__pieExcelCaptureActive = !!active;
+  }
+
+  function isSkuExcelApiUrl(url) {
+    const u = String(url || '').toLowerCase();
+    return u.includes('downloadexcel') || u.includes('goodscommit/action');
+  }
+
+  function isSkuExcelFileUrl(url) {
+    const u = String(url || '').toLowerCase();
+    return (/pfs\.yangkeduo\.com/.test(u) || /excellence-private/.test(u)) && /\.xlsx(\?|$)/.test(u);
+  }
+
+  function scoreExcelUrl(url) {
+    if (isSkuExcelApiUrl(url)) return -1;
+    if (isSkuExcelFileUrl(url)) return 100;
+    if (/\.xlsx(\?|$)/i.test(String(url || ''))) return 80;
+    return 0;
+  }
+
+  async function validateExcelBlob(blob) {
+    if (!blob || blob.size < 4) return false;
+    const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+    if (head[0] === 0x7B) return false;
+    return head[0] === 0x50 && head[1] === 0x4B;
+  }
+
+  function installExcelCaptureHook() {
+    if (document.documentElement.dataset.pieExcelHook) return;
+    document.documentElement.dataset.pieExcelHook = '1';
+
+    const script = document.createElement('script');
+    script.textContent = `
+      (function () {
+        if (window.__pieExcelHook) return;
+        window.__pieExcelHook = true;
+        window.__pieExcelCaptureActive = false;
+        var SOURCE = ${JSON.stringify(EXCEL_HOOK_SOURCE)};
+        var URL_RE = ${EXCEL_URL_RE.toString()};
+        var post = function (payload) {
+          window.postMessage(Object.assign({ source: SOURCE }, payload), '*');
+        };
+        var isExcelLikeBlob = function (blob) {
+          if (!blob || !blob.size || blob.size < 128) return false;
+          if (blob.size > 20 * 1024 * 1024) return false;
+          var t = (blob.type || '').toLowerCase();
+          return /sheet|excel|spreadsheet|ms-excel|zip|octet-stream/.test(t);
+        };
+        var captureBlob = function (blob) {
+          if (!window.__pieExcelCaptureActive) return;
+          if (!isExcelLikeBlob(blob)) return;
+          try {
+            var reader = new FileReader();
+            reader.onload = function () {
+              post({
+                excelBuffer: reader.result,
+                blobType: blob.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              });
+            };
+            reader.readAsArrayBuffer(blob);
+          } catch (e) { /* ignore */ }
+        };
+        var maybeCaptureUrl = function (url, method) {
+          if (!url) return;
+          var u = String(url);
+          if (isDownloadExcelApi(u)) return;
+          if (!URL_RE.test(u)) return;
+          try {
+            post({ url: new URL(u, location.href).href, method: method || 'GET' });
+          } catch (e) { /* ignore */ }
+        };
+        var isExcelContentType = function (ct) {
+          return /sheet|excel|spreadsheet|ms-excel|zip|octet-stream/.test(String(ct || '').toLowerCase());
+        };
+        var isDownloadExcelApi = function (url) {
+          return url && String(url).indexOf('downloadExcel') !== -1;
+        };
+        var captureDownloadExcelJson = function (resp, reqUrl, method) {
+          if (!window.__pieExcelCaptureActive) return;
+          var url = reqUrl || (resp && resp.url) || '';
+          if (!isDownloadExcelApi(url)) return;
+          resp.clone().json().then(function (data) {
+            if (data && data.success && data.result && data.result.url) {
+              post({ url: data.result.url, method: 'GET', excelApi: true });
+            }
+          }).catch(function () {});
+        };
+        var origFetch = window.fetch;
+        window.fetch = function (input, init) {
+          var url = typeof input === 'string' ? input : (input && input.url);
+          maybeCaptureUrl(url, init && init.method);
+          return origFetch.apply(this, arguments).then(function (resp) {
+            try {
+              captureDownloadExcelJson(resp, url, init && init.method);
+              var ct = resp.headers && resp.headers.get('content-type');
+              if (window.__pieExcelCaptureActive && isExcelContentType(ct)) {
+                post({ url: resp.url || url, method: (init && init.method) || 'GET' });
+                resp.clone().blob().then(captureBlob).catch(function () {});
+              }
+            } catch (e) { /* ignore */ }
+            return resp;
+          });
+        };
+        var origOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          this.__pieMethod = method;
+          this.__pieUrl = url;
+          maybeCaptureUrl(url, method);
+          return origOpen.apply(this, arguments);
+        };
+        var origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function () {
+          this.addEventListener('load', function () {
+            if (!window.__pieExcelCaptureActive) return;
+            if (this.status < 200 || this.status >= 300) return;
+            var reqUrl = this.__pieUrl || '';
+            if (isDownloadExcelApi(reqUrl)) {
+              try {
+                var text = typeof this.responseText === 'string' ? this.responseText : '';
+                var data = JSON.parse(text);
+                if (data && data.success && data.result && data.result.url) {
+                  post({ url: data.result.url, method: 'GET', excelApi: true });
+                }
+              } catch (e) { /* ignore */ }
+              return;
+            }
+            var ct = this.getResponseHeader('content-type') || '';
+            if (!isExcelContentType(ct)) return;
+            if (this.response instanceof Blob) {
+              captureBlob(this.response);
+              return;
+            }
+            if (this.response instanceof ArrayBuffer) {
+              post({ excelBuffer: this.response, blobType: ct });
+            }
+          });
+          return origSend.apply(this, arguments);
+        };
+        var origCreateObjectURL = URL.createObjectURL;
+        URL.createObjectURL = function (blob) {
+          var url = origCreateObjectURL.apply(this, arguments);
+          captureBlob(blob);
+          return url;
+        };
+        var shouldBlockExcelNav = function (url) {
+          if (!window.__pieExcelCaptureActive || !url) return false;
+          return /\\.xlsx|pfs\\.yangkeduo\\.com|excellence-private/.test(String(url));
+        };
+        var origWinOpen = window.open;
+        window.open = function (url) {
+          if (shouldBlockExcelNav(url)) {
+            post({ url: String(url), method: 'GET', excelApi: true });
+            return null;
+          }
+          return origWinOpen.apply(this, arguments);
+        };
+        document.addEventListener('click', function (e) {
+          if (!window.__pieExcelCaptureActive) return;
+          var a = e.target && e.target.closest && e.target.closest('a[href]');
+          if (!a || !shouldBlockExcelNav(a.href)) return;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          post({ url: a.href, method: 'GET', excelApi: true });
+        }, true);
+      })();
+    `;
+    (document.documentElement || document.head).appendChild(script);
+    script.remove();
+  }
+
+  function waitForExcelCaptureUrl(timeoutMs = 15000) {
+    const uw = getUnsafeWindow();
+    return new Promise((resolve) => {
+      let timer = null;
+      let best = null;
+      let bestScore = -1;
+      const isAcceptable = (item) => {
+        if (!item) return false;
+        if (item.blob) return true;
+        if (item.fromExcelApi) return true;
+        return isSkuExcelFileUrl(item.url);
+      };
+      const finish = () => {
+        if (timer) clearTimeout(timer);
+        uw.removeEventListener('message', onMessage);
+        resolve(isAcceptable(best) ? best : null);
+      };
+      const onMessage = (event) => {
+        if (event.source !== uw || !event.data || event.data.source !== EXCEL_HOOK_SOURCE) return;
+
+        if (event.data.excelApi && event.data.url) {
+          best = { url: event.data.url, method: 'GET', fromExcelApi: true };
+          finish();
+          return;
+        }
+
+        if (event.data.excelBuffer) {
+          const blob = new Blob([event.data.excelBuffer], {
+            type: event.data.blobType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          });
+          validateExcelBlob(blob).then((ok) => {
+            if (ok) {
+              best = { blob, method: 'BLOB' };
+              finish();
+            }
+          });
+          return;
+        }
+
+        if (!event.data.url) return;
+        const score = scoreExcelUrl(event.data.url);
+        if (score < 0) return;
+        if (score >= bestScore) {
+          bestScore = score;
+          best = { url: event.data.url, method: event.data.method || 'GET' };
+          if (score >= 100) finish();
+        }
+      };
+      uw.addEventListener('message', onMessage);
+      timer = setTimeout(finish, timeoutMs);
+    });
+  }
+
+  function tryInvokeReactOnClick(el) {
+    let fiber = findReactFiber(el);
+    for (let i = 0; i < 50 && fiber; i += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps || fiber.pendingProps;
+      if (!props?.onClick || typeof props.onClick !== 'function') continue;
+      try {
+        props.onClick({
+          preventDefault() {},
+          stopPropagation() {},
+          nativeEvent: new MouseEvent('click'),
+        });
+        return true;
+      } catch {
+        /* ignore */
+      }
+    }
+    return false;
+  }
+
+  function triggerSkuExcelExportClick(el) {
+    const clickable = el.closest('a, button, [role="button"]') || el;
+    try {
+      scrollIntoViewIfNeeded(clickable);
+    } catch {
+      /* ignore */
+    }
+    const uw = getUnsafeWindow();
+    if (tryInvokeReactOnClick(clickable)) return true;
+    clickable.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: uw,
+    }));
+    if (typeof clickable.click === 'function') clickable.click();
+    return true;
+  }
+
+  /** 弹窗内「导出当前规格数据」按钮 */
+  function findSkuExcelModalExportButton() {
+    const scopes = document.querySelectorAll(
+      '[class*="Modal"], [role="dialog"], [class*="modal"], [class*="Drawer"]',
+    );
+    for (const scope of scopes) {
+      if (scope.closest(`#${ROOT_ID}`)) continue;
+      const scopeText = (scope.textContent || '').replace(/\s+/g, '');
+      if (!/Excel批量编辑规格/.test(scopeText)) continue;
+      const nodes = scope.querySelectorAll('button, a, [role="button"]');
+      for (const node of nodes) {
+        const text = (node.textContent || '').replace(/\s+/g, '');
+        if (/导出当前规格数据/.test(text)) {
+          return node.closest('button, a, [role="button"]') || node;
+        }
+      }
+    }
+    for (const node of document.querySelectorAll('button, a, [role="button"]')) {
+      if (node.closest(`#${ROOT_ID}`)) continue;
+      const text = (node.textContent || '').replace(/\s+/g, '');
+      if (/导出当前规格数据/.test(text)) return node;
+    }
+    return null;
+  }
+
+  async function waitForSkuExcelModalExportButton(timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const btn = findSkuExcelModalExportButton();
+      if (btn) return btn;
+      await sleep(200);
+    }
+    return null;
+  }
+
+  function closeSkuExcelModalIfOpen() {
+    const scopes = document.querySelectorAll(
+      '[class*="Modal"], [role="dialog"], [class*="modal"], [class*="Drawer"]',
+    );
+    for (const scope of scopes) {
+      const scopeText = (scope.textContent || '').replace(/\s+/g, '');
+      if (!/Excel批量编辑规格/.test(scopeText)) continue;
+      const closeBtn = scope.querySelector(
+        '[aria-label="关闭"], [aria-label="Close"], ' +
+        'button[class*="close"], button[class*="Close"], [class*="modalClose"]',
+      );
+      if (closeBtn) {
+        triggerSkuExcelExportClick(closeBtn);
+        return;
+      }
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return;
+    }
+  }
+
+  async function captureSkuExcelViaModal() {
+    installExcelCaptureHook();
+
+    let exportBtn = findSkuExcelModalExportButton();
+    if (!exportBtn) {
+      const openEl = findSkuExcelExportElement();
+      if (!openEl) return null;
+      triggerSkuExcelExportClick(openEl);
+      await sleep(600);
+      exportBtn = await waitForSkuExcelModalExportButton(10000);
+      if (!exportBtn) {
+        closeSkuExcelModalIfOpen();
+        return null;
+      }
+    }
+
+    setExcelCaptureActive(true);
+    let captured = null;
+    try {
+      const capturePromise = waitForExcelCaptureUrl(15000);
+      await sleep(120);
+      triggerSkuExcelExportClick(exportBtn);
+      captured = await capturePromise;
+    } finally {
+      setExcelCaptureActive(false);
+      await sleep(300);
+      closeSkuExcelModalIfOpen();
+    }
+
+    if (captured?.blob) return captured;
+    if (captured?.url) return captured;
+    return null;
+  }
+
+  async function resolveSkuExcelDownloadUrl() {
+    const modalResult = await captureSkuExcelViaModal();
+    if (modalResult) return modalResult;
+    return null;
+  }
+
+  async function buildSkuExcelDownloadTaskAsync() {
+    const root = getPddExportRootFolder();
+    if (!root) return null;
+    const meta = await resolveSkuExcelDownloadUrl();
+    if (!meta?.url && !meta?.blob) return null;
+
+    if (meta.blob) {
+      if (!(await validateExcelBlob(meta.blob))) return null;
+    } else if (isSkuExcelApiUrl(meta.url) || !isSkuExcelFileUrl(meta.url)) {
+      return null;
+    }
+
+    const task = {
+      url: meta.url || '',
+      method: meta.method || 'GET',
+      name: joinDownloadPath(root, '成本表.xlsx'),
+      isSkuExcel: true,
+    };
+    if (meta.blob) task.blob = meta.blob;
+    return task;
+  }
+
+  function buildPddCategoryBatches(categoryKeys) {
+    const batches = [];
+    categoryKeys.forEach((key) => {
+      const cat = PDD_CATEGORIES.find((c) => c.key === key);
+      if (!cat) return;
+      const items = images
+        .filter((item) => item.moduleKey === key)
+        .sort((a, b) => a.order - b.order);
+      if (!items.length) return;
+      batches.push({
+        folder: withExportRoot(pddCategoryFolder(cat.label)),
+        items,
+      });
+    });
+    return batches;
+  }
+
+  async function exportPddCategories(categoryKeys, triggerBtn) {
+    const needExcel = isFullPddExport(categoryKeys);
+    const batches = buildPddCategoryBatches(categoryKeys);
+
+    if (!batches.length && !needExcel) {
+      showToast('暂无可导出内容');
       return;
     }
 
-    let success = 0;
-    let fail = 0;
-    let pending = tasks.length;
+    if (categoryKeys.length === 1) {
+      const cat = PDD_CATEGORIES.find((c) => c.key === categoryKeys[0]);
+      if (cat) setFolderPreset(cat.label);
+    }
 
     if (triggerBtn) triggerBtn.disabled = true;
-    showToast(`正在下载 0/${tasks.length}...`);
 
-    const finishOne = () => {
-      pending -= 1;
-      if (pending === 0) {
+    let rootDirHandle = null;
+    if (canUseFileSystemAccess()) {
+      try {
+        showToast(SAVE_DIR_PICK_HINT);
+        rootDirHandle = await ensureSaveDirectory(false);
+      } catch {
         if (triggerBtn) triggerBtn.disabled = false;
-        const folderPaths = [...new Set(tasks.map((t) => {
-          const slash = t.name.lastIndexOf('/');
-          return slash > 0 ? t.name.slice(0, slash) : t.name;
-        }))];
-        const folderHint = folderPaths.length <= 3
-          ? folderPaths.join('、')
-          : `${folderPaths.slice(0, 2).join('、')} 等 ${folderPaths.length} 个目录`;
-        showToast(`下载完成：成功 ${success} 张，失败 ${fail} 张 → ${folderHint}`);
+        hideDownloadProgress();
+        showToast('已取消：需选择保存目录才能按文件夹导出');
+        return;
       }
-    };
+    }
 
-    tasks.forEach((task) => {
+    let totalSuccess = 0;
+    let totalFail = 0;
+    const folderPaths = [];
+
+    const imageTasks = buildDownloadTasksFromBatches(batches);
+    const totalCount = imageTasks.length + (needExcel ? 1 : 0);
+    const concurrency = rootDirHandle ? DOWNLOAD_CONCURRENCY : GM_DOWNLOAD_CONCURRENCY;
+
+    updateDownloadProgress(0, totalCount);
+    showToast(`正在下载 0/${totalCount}…`);
+
+    if (imageTasks.length) {
+      fsDirHandleCache.clear();
+      const imgResult = await runDownloadTasksConcurrent(
+        imageTasks,
+        rootDirHandle,
+        concurrency,
+        (done) => {
+          updateDownloadProgress(done, totalCount);
+          showToast(`正在下载 ${done}/${totalCount}…`);
+        },
+      );
+      totalSuccess += imgResult.success;
+      totalFail += imgResult.fail;
+      imageTasks.forEach((t) => {
+        const slash = t.name.lastIndexOf('/');
+        if (slash > 0) folderPaths.push(t.name.slice(0, slash));
+      });
+    }
+
+    let excelMissing = false;
+    if (needExcel) {
+      updateDownloadProgress(imageTasks.length, totalCount);
+      showToast(`正在下载 ${imageTasks.length}/${totalCount}…`);
+      const excelTask = await buildSkuExcelDownloadTaskAsync();
+      if (excelTask) {
+        fsDirHandleCache.clear();
+        const excelResult = await runDownloadTasksConcurrent(
+          [excelTask],
+          rootDirHandle,
+          concurrency,
+          () => {
+            updateDownloadProgress(totalCount, totalCount);
+            showToast(`正在下载 ${totalCount}/${totalCount}…`);
+          },
+        );
+        totalSuccess += excelResult.success;
+        totalFail += excelResult.fail;
+        const slash = excelTask.name.lastIndexOf('/');
+        if (slash > 0) folderPaths.push(excelTask.name.slice(0, slash));
+      } else {
+        excelMissing = true;
+        totalFail += 1;
+      }
+    }
+
+    hideDownloadProgress();
+    if (triggerBtn) triggerBtn.disabled = false;
+
+    const uniqueFolders = [...new Set(folderPaths)];
+    const folderHint = uniqueFolders.length <= 3
+      ? uniqueFolders.join('、')
+      : `${uniqueFolders.slice(0, 2).join('、')} 等 ${uniqueFolders.length} 个目录`;
+
+    if (rootDirHandle) {
+      let msg = `保存完成：成功 ${totalSuccess} 项，失败 ${totalFail} 项 → 已写入所选目录/${folderHint}`;
+      if (excelMissing) msg += '（成本表获取失败，请手动导出）';
+      showToast(msg);
+      return;
+    }
+
+    let msg = `下载完成：成功 ${totalSuccess} 项，失败 ${totalFail} 项 → ${folderHint}`;
+    if (totalFail > 0) {
+      msg += '（若文件名仍为乱码，请重新下载并在弹窗中选择保存目录）';
+    }
+    if (excelMissing) msg += '（成本表获取失败，请手动导出）';
+    showToast(msg);
+  }
+
+  function scrollIntoViewIfNeeded(el) {
+    if (!el) return;
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      return;
+    } catch {
+      /* Firefox 等不支持 instant */
+    }
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'auto' });
+    } catch {
+      el.scrollIntoView();
+    }
+  }
+
+  function canUseFileSystemAccess() {
+    return typeof window.showDirectoryPicker === 'function' && window.isSecureContext;
+  }
+
+  async function ensureSaveDirectory(forcePick) {
+    if (saveDirHandle && !forcePick) return saveDirHandle;
+    if (!canUseFileSystemAccess()) return null;
+    saveDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    fsDirHandleCache.clear();
+    return saveDirHandle;
+  }
+
+  async function resolveDirHandle(rootHandle, dirParts) {
+    let dir = rootHandle;
+    let key = '';
+    for (const part of dirParts) {
+      key = key ? `${key}/${part}` : part;
+      const cached = fsDirHandleCache.get(key);
+      if (cached) {
+        dir = cached;
+        continue;
+      }
+      dir = await dir.getDirectoryHandle(part, { create: true });
+      fsDirHandleCache.set(key, dir);
+    }
+    return dir;
+  }
+
+  async function writeBlobToDir(rootHandle, relativePath, blob) {
+    const parts = relativePath.split('/').filter(Boolean);
+    if (!parts.length) throw new Error('empty path');
+    const fileName = parts.pop();
+    const dir = await resolveDirHandle(rootHandle, parts);
+    const fileHandle = await dir.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  }
+
+  function gmDownloadBlob(blob, name) {
+    return new Promise((resolve) => {
+      if (typeof GM !== 'undefined' && typeof GM.download === 'function') {
+        GM.download({
+          url: blob,
+          name,
+          saveAs: false,
+          conflictAction: 'overwrite',
+        }).then(() => resolve(true)).catch(() => resolve(false));
+        return;
+      }
       GM_download({
-        url: task.url,
-        name: task.name,
-        onload: () => {
-          success += 1;
-          showToast(`正在下载 ${success + fail}/${tasks.length}...`);
-          finishOne();
-        },
-        onerror: () => {
-          fail += 1;
-          finishOne();
-        },
-        ontimeout: () => {
-          fail += 1;
-          finishOne();
-        },
+        url: blob,
+        name,
+        saveAs: false,
+        conflictAction: 'overwrite',
+        onload: () => resolve(true),
+        onerror: () => resolve(false),
+        ontimeout: () => resolve(false),
       });
     });
   }
 
-  function getSelectionOrderMap() {
-    const selected = images.filter((item) => item.selected);
-    const map = new Map();
-    selected.forEach((item, index) => {
-      map.set(item, index + 1);
-    });
-    return map;
+  async function downloadOneTask(task, rootDirHandle) {
+    let blob = task.blob;
+    if (!blob) {
+      if (!task.url) return false;
+      try {
+        blob = await urlToBlob(task.url, task.method);
+      } catch {
+        return false;
+      }
+    }
+
+    if (task.isSkuExcel && !(await validateExcelBlob(blob))) {
+      return false;
+    }
+
+    if (rootDirHandle) {
+      try {
+        await writeBlobToDir(rootDirHandle, task.name, blob);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const ok = await gmDownloadBlob(blob, task.name);
+    if (GM_DOWNLOAD_GAP_MS > 0) await sleep(GM_DOWNLOAD_GAP_MS);
+    return ok;
   }
 
-  function findItemById(id) {
-    return images.find((item) => item.id === id) || null;
+  function urlToBlobViaXhr(url, method = 'GET') {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: method || 'GET',
+        url,
+        responseType: 'blob',
+        onload(resp) {
+          if (resp.status >= 200 && resp.status < 300 && resp.response) {
+            resolve(resp.response);
+            return;
+          }
+          reject(new Error(`HTTP ${resp.status}`));
+        },
+        onerror: () => reject(new Error('network')),
+        ontimeout: () => reject(new Error('timeout')),
+      });
+    });
+  }
+
+  /** 优先 fetch（命中浏览器已加载缩略图缓存），失败再 GM_xhr */
+  async function urlToBlob(url, method = 'GET') {
+    if (url.startsWith('data:')) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('data fetch failed');
+      return res.blob();
+    }
+    const m = (method || 'GET').toUpperCase();
+    try {
+      const res = await fetch(url, {
+        method: m,
+        credentials: 'include',
+        cache: m === 'GET' ? 'force-cache' : 'no-cache',
+      });
+      if (res.ok) return res.blob();
+    } catch {
+      /* fallback xhr */
+    }
+    return urlToBlobViaXhr(url, m);
+  }
+
+  async function runDownloadTasksConcurrent(tasks, rootDirHandle, concurrency, onProgress) {
+    let cursor = 0;
+    let done = 0;
+    let success = 0;
+    let fail = 0;
+
+    const worker = async () => {
+      while (cursor < tasks.length) {
+        const index = cursor;
+        cursor += 1;
+        const ok = await downloadOneTask(tasks[index], rootDirHandle);
+        if (ok) success += 1;
+        else fail += 1;
+        done += 1;
+        onProgress(done, tasks.length);
+      }
+    };
+
+    const poolSize = Math.max(1, Math.min(concurrency, tasks.length));
+    await Promise.all(Array.from({ length: poolSize }, () => worker()));
+    return { success, fail };
+  }
+
+  async function downloadItemsMulti(batches, triggerBtn, extraTasks = []) {
+    const tasks = [
+      ...buildDownloadTasksFromBatches(batches),
+      ...(extraTasks || []).filter(Boolean),
+    ];
+
+    if (!tasks.length) {
+      showToast('没有可下载的内容');
+      return;
+    }
+
+    let rootDirHandle = null;
+    let usedFsApi = false;
+    fsDirHandleCache.clear();
+
+    if (triggerBtn) triggerBtn.disabled = true;
+
+    if (canUseFileSystemAccess()) {
+      try {
+        showToast(SAVE_DIR_PICK_HINT);
+        rootDirHandle = await ensureSaveDirectory(false);
+        usedFsApi = true;
+      } catch {
+        if (triggerBtn) triggerBtn.disabled = false;
+        hideDownloadProgress();
+        showToast('已取消：需选择保存目录才能按文件夹导出');
+        return;
+      }
+    }
+
+    updateDownloadProgress(0, tasks.length);
+    showToast(`正在下载 0/${tasks.length}…`);
+
+    const concurrency = rootDirHandle ? DOWNLOAD_CONCURRENCY : GM_DOWNLOAD_CONCURRENCY;
+    const { success, fail } = await runDownloadTasksConcurrent(
+      tasks,
+      rootDirHandle,
+      concurrency,
+      (done, total) => {
+        updateDownloadProgress(done, total);
+        showToast(`正在下载 ${done}/${total}…`);
+      },
+    );
+
+    hideDownloadProgress();
+
+    if (triggerBtn) triggerBtn.disabled = false;
+    const folderPaths = [...new Set(tasks.map((t) => {
+      const slash = t.name.lastIndexOf('/');
+      return slash > 0 ? t.name.slice(0, slash) : t.name;
+    }))];
+    const folderHint = folderPaths.length <= 3
+      ? folderPaths.join('、')
+      : `${folderPaths.slice(0, 2).join('、')} 等 ${folderPaths.length} 个目录`;
+
+    if (usedFsApi && rootDirHandle) {
+      showToast(`保存完成：成功 ${success} 项，失败 ${fail} 项 → 已写入所选目录/${folderHint}`);
+      return;
+    }
+
+    let msg = `下载完成：成功 ${success} 项，失败 ${fail} 项 → ${folderHint}`;
+    if (fail > 0 || !usedFsApi) {
+      msg += '（若文件名仍为乱码，请重新下载并在弹窗中选择保存目录）';
+    }
+    showToast(msg);
+  }
+
+  /** 各类目内：已选图片按 DOM 顺序编号 1,2,3…（与下载文件名一致） */
+  function getSelectionOrderMap() {
+    const map = new Map();
+    groupImagesByModule(images).forEach((group) => {
+      let seq = 0;
+      group.items.forEach((item) => {
+        if (!item.selected) return;
+        seq += 1;
+        map.set(item, seq);
+      });
+    });
+    return map;
   }
 
   function syncCardSelectionState(card, item) {
@@ -721,13 +1558,6 @@
     return '.jpg';
   }
 
-  function buildOrderedFilenames(selected) {
-    return selected.map((item, index) => ({
-      url: item.url,
-      filename: `${index + 1}${guessExtension(item.url)}`,
-    }));
-  }
-
   function injectStyles() {
     let style = document.getElementById('pie-styles');
     if (!style) {
@@ -753,6 +1583,7 @@
         width: min(960px, 92vw); max-height: 88vh; background: #fff; border-radius: 12px;
         display: flex; flex-direction: column; overflow: hidden;
         box-shadow: 0 12px 40px rgba(0,0,0,.25);
+        position: relative;
       }
       #${ROOT_ID} .pie-header {
         padding: 16px 20px; min-height: 56px; box-sizing: border-box;
@@ -783,6 +1614,17 @@
       #${ROOT_ID} .pie-folder-preset-btn.active {
         background: #eff6ff; border-color: #2563eb; color: #1d4ed8;
       }
+      #${ROOT_ID} .pie-quick-export-btn {
+        box-sizing: border-box; display: inline-flex !important; align-items: center;
+        padding: 8px 14px; border: 1px solid #2563eb; border-radius: 6px;
+        font-size: 13px; line-height: 1.3; cursor: pointer; user-select: none; white-space: nowrap;
+        flex: 0 0 auto;
+      }
+      #${ROOT_ID} .pie-quick-export-all {
+        background: #fff; color: #111827; border-color: #2563eb;
+      }
+      #${ROOT_ID} .pie-quick-export-all:hover { background: #eff6ff; color: #111827; }
+      #${ROOT_ID} .pie-quick-export-all:disabled { opacity: .6; cursor: not-allowed; }
       #${ROOT_ID} .pie-actions {
         display: flex; gap: 8px; flex: 0 0 auto; flex-wrap: nowrap;
         align-items: center; margin-left: auto;
@@ -839,6 +1681,43 @@
         display: flex; align-items: center; justify-content: center; z-index: 1;
       }
       #${ROOT_ID} .pie-empty { padding: 24px; text-align: center; color: #6b7280; }
+      #${ROOT_ID} .pie-download-progress {
+        position: absolute; inset: 0; z-index: 20;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(255, 255, 255, 0.88);
+        opacity: 0; visibility: hidden;
+        transition: opacity .22s ease, visibility .22s ease;
+        pointer-events: none;
+      }
+      #${ROOT_ID} .pie-download-progress.visible {
+        opacity: 1; visibility: visible; pointer-events: auto;
+      }
+      #${ROOT_ID} .pie-progress-ring {
+        position: relative; width: 108px; height: 108px;
+      }
+      #${ROOT_ID} .pie-progress-ring svg {
+        width: 100%; height: 100%; transform: rotate(-90deg);
+      }
+      #${ROOT_ID} .pie-progress-track {
+        fill: none; stroke: #e5e7eb; stroke-width: 7;
+      }
+      #${ROOT_ID} .pie-progress-bar {
+        fill: none; stroke: #2563eb; stroke-width: 7;
+        stroke-linecap: round;
+        transition: stroke-dashoffset .28s ease;
+      }
+      #${ROOT_ID} .pie-progress-text {
+        position: absolute; inset: 0;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        pointer-events: none;
+      }
+      #${ROOT_ID} .pie-progress-count {
+        font-size: 20px; font-weight: 700; color: #111827; line-height: 1.15;
+        font-variant-numeric: tabular-nums;
+      }
+      #${ROOT_ID} .pie-progress-label {
+        font-size: 12px; color: #6b7280; margin-top: 4px;
+      }
     `;
   }
 
@@ -851,6 +1730,55 @@
       document.documentElement.appendChild(root);
     }
     return root;
+  }
+
+  const PROGRESS_RING_R = 34;
+  const PROGRESS_RING_C = 2 * Math.PI * PROGRESS_RING_R;
+
+  function ensureDownloadProgressLayer() {
+    const panel = document.querySelector(`#${ROOT_ID} .pie-panel`);
+    if (!panel) return null;
+
+    let layer = panel.querySelector('.pie-download-progress');
+    if (layer) return layer;
+
+    layer = document.createElement('div');
+    layer.className = 'pie-download-progress';
+    layer.innerHTML = [
+      '<div class="pie-progress-ring">',
+      '<svg viewBox="0 0 80 80" aria-hidden="true">',
+      `<circle class="pie-progress-track" cx="40" cy="40" r="${PROGRESS_RING_R}" />`,
+      `<circle class="pie-progress-bar" cx="40" cy="40" r="${PROGRESS_RING_R}"`,
+      ` stroke-dasharray="${PROGRESS_RING_C}" stroke-dashoffset="${PROGRESS_RING_C}" />`,
+      '</svg>',
+      '<div class="pie-progress-text">',
+      '<span class="pie-progress-count">0/0</span>',
+      '<span class="pie-progress-label">下载中</span>',
+      '</div>',
+      '</div>',
+    ].join('');
+    panel.appendChild(layer);
+    return layer;
+  }
+
+  function updateDownloadProgress(done, total) {
+    const layer = ensureDownloadProgressLayer();
+    if (!layer) return;
+
+    const safeTotal = Math.max(0, total);
+    const safeDone = Math.min(Math.max(0, done), safeTotal);
+    const pct = safeTotal > 0 ? safeDone / safeTotal : 0;
+
+    layer.classList.add('visible');
+    const bar = layer.querySelector('.pie-progress-bar');
+    const count = layer.querySelector('.pie-progress-count');
+    if (bar) bar.style.strokeDashoffset = `${PROGRESS_RING_C * (1 - pct)}`;
+    if (count) count.textContent = `${safeDone}/${safeTotal}`;
+  }
+
+  function hideDownloadProgress() {
+    const layer = document.querySelector(`#${ROOT_ID} .pie-download-progress`);
+    if (layer) layer.classList.remove('visible');
   }
 
   function showToast(message) {
@@ -964,15 +1892,17 @@
         e.stopPropagation();
         const isPddCategory = group.items.length > 0 && isPddPresetCategory(group.items[0].moduleKey);
         const folder = isPddCategory
-          ? pddCategoryFolder(group.label)
+          ? withExportRoot(pddCategoryFolder(group.label))
           : sanitizePathPart((folderInput && folderInput.value.trim()) || group.label, group.label);
         if (!folder) {
           showToast('请先填写文件夹名');
           if (folderInput) folderInput.focus();
           return;
         }
-        if (isPddCategory) setFolderPreset(folder);
-        downloadItems(group.items, folder, sectionDownloadAllBtn);
+        if (isPddCategory) setFolderPreset(pddCategoryFolder(group.label));
+        const selectedInGroup = group.items.filter((item) => item.selected);
+        const toDownload = selectedInGroup.length > 0 ? selectedInGroup : group.items;
+        downloadItems(toDownload, folder, sectionDownloadAllBtn);
       });
 
       actions.appendChild(sectionSelectAllBtn);
@@ -1009,6 +1939,7 @@
     }
 
     images = discoverImages();
+    pddExportRoot = isPddMmsPage() ? resolvePddExportRoot() : null;
 
     const overlay = document.createElement('div');
     overlay.className = 'pie-overlay';
@@ -1065,6 +1996,18 @@
     panelFolderInput = folderInput;
     panelSyncPresets = syncPresetButtons;
 
+    let quickExportBtn = null;
+    if (isPddMmsPage()) {
+      quickExportBtn = document.createElement('button');
+      quickExportBtn.type = 'button';
+      quickExportBtn.className = 'pie-quick-export-btn pie-quick-export-all';
+      quickExportBtn.textContent = '一键导出';
+      quickExportBtn.title = '导出轮播图、详情图、预览图';
+      quickExportBtn.addEventListener('click', () => {
+        exportPddCategories(PDD_CATEGORY_ORDER, quickExportBtn);
+      });
+    }
+
     const selectAllBtn = document.createElement('button');
     selectAllBtn.textContent = '全选';
     selectAllBtn.addEventListener('click', () => {
@@ -1086,9 +2029,13 @@
     const closeBtn = document.createElement('button');
     closeBtn.textContent = '关闭';
     closeBtn.addEventListener('click', () => {
+      hideDownloadProgress();
       root.innerHTML = '';
       panelFolderInput = null;
       panelSyncPresets = null;
+      saveDirHandle = null;
+      pddExportRoot = null;
+      fsDirHandleCache.clear();
       createFab();
     });
 
@@ -1117,7 +2064,9 @@
         return;
       }
 
-      const pddBatches = batches.filter((b) => FOLDER_PRESETS.includes(b.folder));
+      const pddBatches = batches.filter(
+        (b) => b.items.length > 0 && isPddPresetCategory(b.items[0].moduleKey),
+      );
       if (pddBatches.length === 1 && batches.length === 1) {
         setFolderPreset(pddBatches[0].folder);
       }
@@ -1128,6 +2077,7 @@
     header.appendChild(title);
     header.appendChild(folderInput);
     header.appendChild(presets);
+    if (quickExportBtn) header.appendChild(quickExportBtn);
     header.appendChild(actions);
     actions.appendChild(selectAllBtn);
     actions.appendChild(deselectAllBtn);
@@ -1233,6 +2183,8 @@
   }
 
   function createFab() {
+    if (isPddMmsPage()) installExcelCaptureHook();
+
     const root = ensureRoot();
     if (root.querySelector('.pie-fab')) return;
 
