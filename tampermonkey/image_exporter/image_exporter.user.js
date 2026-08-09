@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.5.1
+// @version      1.5.3
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -564,7 +564,7 @@
 
   /**
    * 构建下载任务：按类目内 DOM 顺序全局连续编号 1,2,3…
-   * 类目总数 >12 张时：{folder}/1-12/1.jpg … {folder}/13-24/13.jpg …
+   * 仅预览图且总数 >12 张时分桶：{folder}/1-12/1.jpg … {folder}/13-24/13.jpg …
    */
   function splitFolderPath(baseFolder) {
     return String(baseFolder || '')
@@ -588,10 +588,10 @@
     return idx >= 0 ? idx + 1 : 0;
   }
 
-  /** 全局序号所在分桶目录名，如 1-12、13-24 */
-  function chunkRangeLabel(seq) {
+  /** 全局序号所在分桶目录名，如 1-12、13-24；末桶上限按实际总数截断（如 25-25） */
+  function chunkRangeLabel(seq, total) {
     const start = Math.floor((seq - 1) / CHUNK_SIZE) * CHUNK_SIZE + 1;
-    const end = start + CHUNK_SIZE - 1;
+    const end = Math.min(start + CHUNK_SIZE - 1, total);
     return `${start}-${end}`;
   }
 
@@ -601,7 +601,7 @@
     if (!folderParts.length) folderParts.push('images');
     const moduleKey = sorted[0]?.moduleKey;
     const categoryTotal = moduleKey ? getCategoryTotal(moduleKey) : sorted.length;
-    const useChunks = categoryTotal > CHUNK_SIZE;
+    const useChunks = moduleKey === 'category:preview' && categoryTotal > CHUNK_SIZE;
 
     return sorted.map((item, index) => {
       const seq = getCategoryPosition(item) || index + 1;
@@ -611,7 +611,7 @@
       }
       return {
         url: item.url,
-        name: joinDownloadPath(...folderParts, chunkRangeLabel(seq), `${seq}${ext}`),
+        name: joinDownloadPath(...folderParts, chunkRangeLabel(seq, categoryTotal), `${seq}${ext}`),
       };
     });
   }

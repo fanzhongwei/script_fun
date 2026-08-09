@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         规格名称批量粘贴
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.1.0
+// @version      1.2.3
 // @description  拼多多商家后台商品规格编辑页：在第一个规格名称框粘贴多值，自动拆分并依次填充
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -11,7 +11,20 @@
 (function () {
   'use strict';
 
-  const SPEC_INPUT_SELECTOR = '.spec-input input[placeholder="请输入规格名称"]';
+  const SPEC_NAME_PLACEHOLDER = '请输入规格名称';
+  /** 旧版：.spec-input；新版：#newSpec / .goods-sku-box / .package-container */
+  const LEGACY_SPEC_INPUT_SELECTOR = `.spec-input input[placeholder="${SPEC_NAME_PLACEHOLDER}"]`;
+  const NEW_SPEC_SCOPE_SELECTOR = [
+    '.custom-input-container',
+    '.package-item-container',
+    '.package-container',
+    '.property-values-container',
+    '.custom-package',
+    '.property-container-v2',
+    '.goods-sku-box',
+    '#newSpec',
+    '#stand_spec',
+  ].join(', ');
   const PASTE_SPLIT = /[\s,;，；|｜/／\\、\t\n\r]+/;
   const FILL_STEP_DELAY_MS = 100;
   const WAIT_TIMEOUT_MS = 3000;
@@ -20,13 +33,123 @@
 
   let isFilling = false;
 
-  function isSpecInput(el) {
-    if (!(el instanceof HTMLInputElement)) return false;
-    return el.matches(SPEC_INPUT_SELECTOR);
+  function isLegacySpecInput(input) {
+    return input instanceof HTMLInputElement && input.matches(LEGACY_SPEC_INPUT_SELECTOR);
   }
 
-  /** 向上查找规格组根节点：父级存在多个含 .spec-input 的子树时停止 */
-  function findGroupRoot(firstInput) {
+  /** 排除 SKU 价格/库存表内的 input */
+  function isInSkuPriceTable(el) {
+    return !!el.closest(
+      'table[class*="TB_tableWrapper"], [class*="TB_body"], [data-testid="beast-core-table-middle-body"]',
+    );
+  }
+
+  /**
+   * 排除价格表头「全部颜色/全部尺寸」等筛选下拉及其搜索框。
+   * 批量填充 blur 后焦点可能落到这些控件，导致复制中断。
+   */
+  function isInSkuBatchFilter(el) {
+    if (!el || !el.closest) return false;
+    if (el.closest([
+      '[data-testid*="select"]',
+      '[data-testid*="Select"]',
+      '[class*="ST_"]',
+      '[class*="Select"]',
+      '[role="listbox"]',
+      '[role="combobox"]',
+      '[class*="dropdown"]',
+      '[class*="Dropdown"]',
+      '[class*="popover"]',
+      '[class*="Popover"]',
+      '[class*="overlay"]',
+    ].join(', '))) {
+      return true;
+    }
+
+    let node = el;
+    for (let i = 0; i < 10 && node && node !== document.body; i += 1, node = node.parentElement) {
+      const text = (node.textContent || '').replace(/\s+/g, ' ');
+      if (!/全部颜色|全部尺寸|全部规格/.test(text)) continue;
+      if (/批量设置|拼单价|单买价|规格编码|库存/.test(text)) return true;
+    }
+    return false;
+  }
+
+  function looksLikeSpecNamePlaceholder(placeholder, allowEmpty) {
+    const text = String(placeholder || '').trim();
+    if (!text) return !!allowEmpty;
+    if (text === SPEC_NAME_PLACEHOLDER) return true;
+    // 新版自定义规格：自定义尺寸 / 自定义重量 / 自定义颜色 …
+    if (/^自定义/.test(text)) return true;
+    if (/规格名称|请输入规格|输入规格|规格值/.test(text)) return true;
+    if (text === '请输入') return true;
+    if (/库存|价格|编码|数量|重量单位|拼单价|单买价|全部颜色|全部尺寸|搜索/.test(text)) return false;
+    return false;
+  }
+
+  function isNewLayoutSpecInput(input) {
+    if (!(input instanceof HTMLInputElement)) return false;
+    if (input.type && input.type !== 'text' && input.type !== 'search') return false;
+    if (isInSkuPriceTable(input) || isInSkuBatchFilter(input)) return false;
+    // 新版最稳锚点：自定义规格输入容器内的 beast-core input
+    if (input.closest('.custom-input-container, .package-item-container')) {
+      return looksLikeSpecNamePlaceholder(input.placeholder, true)
+        || !/库存|价格|编码|拼单价|单买价|全部颜色|全部尺寸|搜索/.test(input.placeholder || '');
+    }
+    // 勿仅凭 .goods-sku-box 放宽：会误收价格表头筛选 input
+    if (!input.closest([
+      '.custom-input-container',
+      '.package-item-container',
+      '.package-container',
+      '.property-values-container',
+      '.custom-package',
+      '.property-container-v2',
+      '#newSpec',
+      '#stand_spec',
+    ].join(', '))) {
+      return false;
+    }
+    return looksLikeSpecNamePlaceholder(input.placeholder, false);
+  }
+
+  /** blur 后若焦点掉到表头筛选下拉，立刻移开，避免中断后续填充 */
+  function dismissStraySkuFilterFocus() {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return;
+    if (isInSkuBatchFilter(active) || isInSkuPriceTable(active)) {
+      active.blur();
+    }
+  }
+
+  function isSpecInput(el) {
+    if (!(el instanceof HTMLInputElement)) return false;
+    if (isInSkuPriceTable(el) || isInSkuBatchFilter(el)) return false;
+    return isLegacySpecInput(el) || isNewLayoutSpecInput(el);
+  }
+
+  function querySpecInputs(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll('input')].filter(isSpecInput);
+  }
+
+  function getAllSpecNameInputs() {
+    const scopes = document.querySelectorAll('#goods-spec-sku, #sku, #newSpec, .goods-sku-box');
+    const seen = new Set();
+    const inputs = [];
+    const collect = (root) => {
+      querySpecInputs(root).forEach((input) => {
+        if (seen.has(input)) return;
+        seen.add(input);
+        inputs.push(input);
+      });
+    };
+    scopes.forEach(collect);
+    if (inputs.length === 0) collect(document);
+    return inputs;
+  }
+
+  /** 旧版：向上查找规格组根节点，父级存在多个含 .spec-input 的子树时停止 */
+  function findGroupRootLegacy(firstInput) {
     const row = firstInput.closest('.spec-input');
     if (!row) return document.body;
 
@@ -40,9 +163,54 @@
     return root;
   }
 
+  /** 新版：优先 package-container（同组多个 package-item） */
+  function findGroupRootNew(firstInput) {
+    const packageContainer = firstInput.closest('.package-container');
+    if (packageContainer && querySpecInputs(packageContainer).length > 0) {
+      return packageContainer;
+    }
+    const valuesRoot = firstInput.closest('.property-values-container');
+    if (valuesRoot && querySpecInputs(valuesRoot).length > 0) {
+      return valuesRoot;
+    }
+    const preferred = firstInput.closest('.custom-package, .property-container-v2');
+    if (preferred && querySpecInputs(preferred).length > 0) {
+      return preferred;
+    }
+
+    const scope = firstInput.closest('.goods-sku-box, #newSpec, #stand_spec, #goods-spec-sku')
+      || document.body;
+
+    let el = firstInput;
+    while (el && el !== scope) {
+      const hasDelete = [...el.querySelectorAll('a, button, span')].some(
+        (node) => /删除规格类型|删除/.test((node.textContent || '').replace(/\s+/g, '')),
+      );
+      if (hasDelete && querySpecInputs(el).length > 0) return el;
+      el = el.parentElement;
+    }
+
+    let root = firstInput.closest('[data-testid="beast-core-grid-col-wrapper"]')
+      || firstInput.closest('[data-testid="beast-core-input"]')
+      || firstInput;
+
+    while (root.parentElement && root.parentElement !== scope && scope.contains(root.parentElement)) {
+      const parent = root.parentElement;
+      const clusters = [...parent.children].filter((child) => querySpecInputs(child).length > 0);
+      if (clusters.length > 1) break;
+      root = parent;
+    }
+    return root;
+  }
+
+  function findGroupRoot(firstInput) {
+    if (firstInput.closest('.spec-input')) return findGroupRootLegacy(firstInput);
+    return findGroupRootNew(firstInput);
+  }
+
   function getSpecInputsInGroup(firstInput) {
     const root = findGroupRoot(firstInput);
-    return [...root.querySelectorAll(SPEC_INPUT_SELECTOR)];
+    return querySpecInputs(root);
   }
 
   function isFirstSpecInput(input) {
@@ -54,7 +222,7 @@
   function getAllSpecGroupRoots() {
     const roots = [];
     const seen = new Set();
-    [...document.querySelectorAll(SPEC_INPUT_SELECTOR)].forEach((input) => {
+    getAllSpecNameInputs().forEach((input) => {
       if (!isFirstSpecInput(input)) return;
       const root = findGroupRoot(input);
       if (seen.has(root)) return;
@@ -143,7 +311,7 @@
       };
 
       const check = () => {
-        const inputs = [...groupRoot.querySelectorAll(SPEC_INPUT_SELECTOR)];
+        const inputs = querySpecInputs(groupRoot);
         if (inputs.length >= requiredLength && inputs[index]) {
           cleanup();
           resolve(inputs[index]);
@@ -208,6 +376,7 @@
     input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
     input.blur();
     await delay(FILL_STEP_DELAY_MS);
+    dismissStraySkuFilterFocus();
   }
 
   async function clearSpecInput(input) {
@@ -217,10 +386,11 @@
     input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
     input.blur();
     await delay(FILL_STEP_DELAY_MS);
+    dismissStraySkuFilterFocus();
   }
 
   async function clearSpecInputsFromIndex(groupRoot, fromIndex) {
-    const inputs = [...groupRoot.querySelectorAll(SPEC_INPUT_SELECTOR)];
+    const inputs = querySpecInputs(groupRoot);
     for (let j = inputs.length - 1; j >= fromIndex; j -= 1) {
       await clearSpecInput(inputs[j]);
     }
@@ -256,6 +426,24 @@
     return { filled, remaining: 0 };
   }
 
+  function resolvePasteTarget(target) {
+    if (target instanceof HTMLInputElement && isSpecInput(target)) return target;
+    if (!(target instanceof Element)) return null;
+    const nested = target.querySelector?.('input');
+    if (nested instanceof HTMLInputElement && isSpecInput(nested)) return nested;
+    const closestInput = target.closest?.('input');
+    if (closestInput instanceof HTMLInputElement && isSpecInput(closestInput)) return closestInput;
+    // 点在 package-container 空白处粘贴时，取该容器内第一个规格框
+    const container = target.closest?.(
+      '.package-container, .property-values-container, .custom-package, .property-container-v2',
+    );
+    if (container) {
+      const inputs = querySpecInputs(container);
+      if (inputs.length > 0) return inputs[0];
+    }
+    return null;
+  }
+
   async function handlePaste(firstInput, text) {
     const columnIndex = getGroupColumnIndex(firstInput);
     const names = parseSpecNames(text, columnIndex);
@@ -273,11 +461,12 @@
   }
 
   function interceptPasteEvent(e) {
-    if (!isFirstSpecInput(e.target)) return false;
+    const input = resolvePasteTarget(e.target);
+    if (!input || !isFirstSpecInput(input)) return null;
     e.preventDefault();
     e.stopImmediatePropagation();
-    if (isFilling) return false;
-    return true;
+    if (isFilling) return null;
+    return input;
   }
 
   document.addEventListener('beforeinput', (e) => {
@@ -286,8 +475,9 @@
   }, true);
 
   document.addEventListener('paste', (e) => {
-    if (!interceptPasteEvent(e)) return;
+    const input = interceptPasteEvent(e);
+    if (!input) return;
     const text = e.clipboardData?.getData('text') || '';
-    void handlePaste(e.target, text);
+    void handlePaste(input, text);
   }, true);
 })();
