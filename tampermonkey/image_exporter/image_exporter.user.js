@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.0
+// @version      1.6.3
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -85,6 +85,9 @@
     { key: 'category:detail', label: '详情图' },
     { key: 'category:preview', label: '预览图' },
   ];
+  /** 与平台轮播「宽高均大于 480」对齐；用于过滤「文本暂无预览」等过小占位图 */
+  const PDD_MIN_IMAGE_EDGE_PX = 480;
+  const PDD_PLACEHOLDER_TEXT_RE = /文本暂无预览|暂无预览|无预览/;
 
   function isPddMmsPage() {
     return /mms\.pinduoduo\.com/i.test(location.hostname);
@@ -342,26 +345,81 @@
     return roots;
   }
 
+  function pieExtractTypeLabelFromSpecRow(specRow) {
+    if (!specRow) return '';
+    const specIdBlock = specRow.querySelector('[id*="parentSpecArr"][id*="spec_id"], [id*="spec_id"]');
+    const scope = specIdBlock || specRow.querySelector('.goods-spec-row-left') || specRow;
+
+    const input = scope.querySelector(
+      '[class*="ST_selectValueSingle"] input, [class*="ST_inputWrapper"] input, [class*="IPT_inputWrapper"] input, input',
+    );
+    if (input) {
+      const val = pieNormText(input.value || input.getAttribute('value') || '');
+      if (val && val !== '规格' && !/请选择|删除|添加/.test(val)) return val;
+    }
+
+    const single = scope.querySelector('[class*="ST_selectValueSingle"], [class*="ST_inputWrapper"]');
+    if (single) {
+      const text = pieNormText(single.textContent);
+      if (text && text.length <= 20 && text !== '规格' && !/请选择|删除|添加|请输入/.test(text)) {
+        return text;
+      }
+    }
+    return pieExtractTypeLabel(specRow);
+  }
+
   function pieExtractTypeLabel(groupRoot) {
+    const titleRow = groupRoot.querySelector('.goods-spec-row-title, [class*="spec-row-title"]');
+    if (titleRow) {
+      const selectEl = titleRow.querySelector(
+        '[class*="Select"], [data-testid*="select"], input[readonly], [class*="select"]',
+      );
+      if (selectEl) {
+        const selText = pieNormText(selectEl.textContent || selectEl.value);
+        if (selText && selText.length <= 20 && !/删除|添加|请输入|规格值/.test(selText)) {
+          return selText;
+        }
+      }
+      const rowText = pieNormText(titleRow.textContent)
+        .replace(/删除规格类型.*$/g, '')
+        .replace(/添加.*$/g, '')
+        .trim();
+      if (rowText && rowText.length <= 20 && !/删除|添加|最多添加|请输入/.test(rowText)) {
+        return rowText;
+      }
+    }
+
     const nodes = groupRoot.querySelectorAll(
       '[class*="Select"], [data-testid*="select"], [class*="title"], [class*="label"], span, div',
     );
     for (const node of nodes) {
       const text = pieNormText(node.textContent);
       if (!text || text.length > 20) continue;
-      if (/删除|添加|请输入|规格值|规格名称/.test(text)) continue;
+      if (/删除|添加|请输入|规格值|规格名称|最多添加/.test(text)) continue;
       if (node.closest('.custom-input-container, .package-item-container')) continue;
+      if (text === '规格') continue;
       if (PIE_STYLE_HEADER_NAMES.has(text) || /^自定义/.test(text)) return text;
     }
     const header = groupRoot.querySelector('[class*="header"], [class*="title"]');
     if (header) {
       const text = pieNormText(header.textContent);
-      if (text && !/删除|添加/.test(text)) return text;
+      if (text && text !== '规格' && !/删除|添加/.test(text)) return text;
     }
-    return '规格';
+    return '';
   }
 
   function collectSpecDimensionsForManifest() {
+    const specRows = [...document.querySelectorAll(
+      '#spec .goods-spec-row, .goods-sku-box.goods-spec .goods-spec-row',
+    )].filter((row) => !row.closest(`#${ROOT_ID}`));
+
+    if (specRows.length) {
+      return specRows.map((row) => {
+        const values = pieQuerySpecInputs(row).map((input) => input.value.trim()).filter(Boolean);
+        return { typeLabel: pieExtractTypeLabelFromSpecRow(row), values };
+      }).filter((dim) => dim.typeLabel || dim.values.length > 0);
+    }
+
     return pieGetAllSpecGroupRoots().map((root) => {
       const inputs = pieQuerySpecInputs(root);
       const values = inputs.map((input) => input.value.trim()).filter(Boolean);
@@ -479,9 +537,45 @@
     let node = img;
     for (let i = 0; i < 8 && node; i += 1, node = node.parentElement) {
       const text = (node.textContent || '').replace(/\s+/g, '');
-      if (/文本暂无预览|暂无预览|无预览/.test(text)) return true;
+      if (PDD_PLACEHOLDER_TEXT_RE.test(text)) return true;
     }
     return false;
+  }
+
+  function isHtmlImageTooSmall(img) {
+    if (!(img instanceof HTMLImageElement)) return false;
+    if (!img.complete || img.naturalWidth <= 0) return false;
+    return Math.min(img.naturalWidth, img.naturalHeight) < PDD_MIN_IMAGE_EDGE_PX;
+  }
+
+  function probeImageMinEdge(url, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
+    return new Promise((resolve) => {
+      if (!url) {
+        resolve(false);
+        return;
+      }
+      const img = new Image();
+      const finish = (ok) => {
+        img.onload = null;
+        img.onerror = null;
+        resolve(ok);
+      };
+      img.onload = () => finish(Math.min(img.naturalWidth, img.naturalHeight) >= minEdge);
+      img.onerror = () => finish(false);
+      try {
+        img.src = url;
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  async function filterUrlsByMinEdge(urls, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
+    const out = [];
+    for (const url of urls) {
+      if (await probeImageMinEdge(url, minEdge)) out.push(url);
+    }
+    return out;
   }
 
   function collectDetailImages() {
@@ -491,6 +585,7 @@
     const urls = [];
     root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]').forEach((img) => {
       if (isDetailImagePlaceholder(img)) return;
+      if (isHtmlImageTooSmall(img)) return;
       const candidate = collectImgCandidates(img).map((raw) => toAbsoluteUrl(raw)).find(Boolean);
       if (candidate) urls.push(candidate);
     });
@@ -523,7 +618,12 @@
     const root = findCarouselRoot();
     if (!root) return urls;
 
-    root.querySelectorAll('[class*="MaterialModalButton_v2_imageBox"]').forEach((el) => {
+    const nodes = root.querySelectorAll(
+      '[class*="MaterialModalButton_v2_imageBox"], ' +
+      '[class*="MaterialModalButton_v2_imgContainer"], ' +
+      '[class*="MaterialModalButton_v2_imageWrapper"]',
+    );
+    nodes.forEach((el) => {
       if (el.closest(`#${ROOT_ID}`)) return;
       const abs = firstBackgroundUrl(el);
       if (abs) urls.push(abs);
@@ -531,7 +631,7 @@
     return dedupeUrlsOrdered(urls);
   }
 
-  function discoverImagesPdd() {
+  async function discoverImagesPdd() {
     const collectors = {
       'category:carousel': collectCarouselImages,
       'category:detail': collectDetailImages,
@@ -539,10 +639,14 @@
     };
     let order = 0;
     const entries = [];
-    PDD_CATEGORIES.forEach(({ key, label }) => {
+    for (const { key, label } of PDD_CATEGORIES) {
       const collect = collectors[key];
-      if (!collect) return;
-      collect().forEach((url) => {
+      if (!collect) continue;
+      let urls = collect();
+      if (key === 'category:carousel' || key === 'category:detail') {
+        urls = await filterUrlsByMinEdge(urls);
+      }
+      urls.forEach((url) => {
         entries.push({
           id: `pie-${order}`,
           url,
@@ -552,7 +656,7 @@
           order: order++,
         });
       });
-    });
+    }
     return entries;
   }
 
@@ -697,9 +801,9 @@
     return entries;
   }
 
-  function discoverImages() {
+  async function discoverImages() {
     if (isPddMmsPage()) {
-      const pdd = discoverImagesPdd();
+      const pdd = await discoverImagesPdd();
       if (pdd.length > 0) return pdd;
     }
     return discoverImagesGeneric();
@@ -2141,7 +2245,7 @@
       root.innerHTML = '';
     }
 
-    images = discoverImages();
+    images = await discoverImages();
     pddExportRoot = isPddMmsPage() ? resolvePddExportRoot() : null;
 
     const overlay = document.createElement('div');

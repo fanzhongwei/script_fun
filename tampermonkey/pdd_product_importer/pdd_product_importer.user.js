@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.0.0
+// @version      1.1.0
 // @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -19,7 +19,10 @@
   const CHUNK_SIZE = 12;
   const SKU_ROW_HEIGHT_PX = 70;
   const FILL_STEP_DELAY_MS = 100;
+  const DETAIL_DELETE_GAP_MS = 40;
+  const PREVIEW_DELETE_GAP_MS = 40;
   const WAIT_TIMEOUT_MS = 5000;
+  const PDD_MIN_IMAGE_EDGE_PX = 480;
   const PDD_SKU_ROW_IN_TABLE = 'tbody tr[class*="TB_tr"], tbody [data-testid="beast-core-table-body-tr"]';
 
   /** @type {boolean} */
@@ -31,6 +34,31 @@
 
   function pieNormText(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  async function focusPipelineSection(selectors, waitMs = 350) {
+    const list = Array.isArray(selectors) ? selectors : [selectors];
+    for (const sel of list) {
+      const el = document.querySelector(sel);
+      if (!el || el.closest(`#${ROOT_ID}`)) continue;
+      try {
+        el.scrollIntoView({ block: 'center', behavior: 'auto' });
+      } catch {
+        el.scrollIntoView();
+      }
+      await sleep(waitMs);
+      return true;
+    }
+    return false;
+  }
+
+  function dedupeElements(list) {
+    const seen = new Set();
+    return list.filter((el) => {
+      if (!el || seen.has(el)) return false;
+      seen.add(el);
+      return true;
+    });
   }
 
   function ensureRoot() {
@@ -71,6 +99,38 @@
     return key ? el[key] : null;
   }
 
+  function createMouseEvent(type, init = {}) {
+    const opts = { bubbles: true, cancelable: true, ...init };
+    delete opts.view;
+    try {
+      return new MouseEvent(type, opts);
+    } catch {
+      try {
+        const ev = document.createEvent('MouseEvents');
+        ev.initMouseEvent(
+          type,
+          true,
+          true,
+          document.defaultView,
+          0,
+          0,
+          0,
+          opts.clientX || 0,
+          opts.clientY || 0,
+          false,
+          false,
+          false,
+          false,
+          0,
+          null,
+        );
+        return ev;
+      } catch {
+        return new Event(type, { bubbles: true, cancelable: true });
+      }
+    }
+  }
+
   function tryInvokeReactOnClick(el) {
     let fiber = findReactFiber(el);
     for (let i = 0; i < 50 && fiber; i += 1, fiber = fiber.return) {
@@ -80,7 +140,7 @@
         props.onClick({
           preventDefault() {},
           stopPropagation() {},
-          nativeEvent: new MouseEvent('click'),
+          nativeEvent: createMouseEvent('click'),
         });
         return true;
       } catch {
@@ -98,7 +158,7 @@
       /* ignore */
     }
     if (tryInvokeReactOnClick(el)) return true;
-    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(createMouseEvent('click'));
     if (typeof el.click === 'function') el.click();
     return true;
   }
@@ -224,6 +284,12 @@
 
   function findDeleteButton(container) {
     if (!container) return null;
+    const icon = container.querySelector(
+      '[class*="DeleteIcon_v2"], [class*="DeleteIcon"], ' +
+      '[data-tracking-click-viewid*="delete"], [data-tracking-click-viewid*="Delete"]',
+    );
+    if (icon) return icon.closest('a, button, [role="button"], i, span') || icon;
+
     const nodes = container.querySelectorAll('a, button, span, [role="button"], i, svg');
     for (const node of nodes) {
       const text = (node.textContent || '').replace(/\s+/g, '');
@@ -243,13 +309,26 @@
       '#picture [class*="MaterialModalButton_v2_materialContainer"]',
     );
     if (inGallery && !inGallery.closest(`#${ROOT_ID}`)) return inGallery;
-    return document.querySelector('#picture') || null;
+    return document.querySelector('#basic\\.carousel_gallery, #picture') || null;
   }
 
   function getCarouselImageBoxes() {
     const root = findCarouselRoot();
     if (!root) return [];
-    return [...root.querySelectorAll('[class*="MaterialModalButton_v2_imageBox"]')];
+    const primary = [...root.querySelectorAll(
+      '[class*="MaterialModalButton_v2_imageBox"], [class*="MaterialModalButton_v2_imageWrapper"]',
+    )];
+    if (primary.length) return primary;
+
+    const seen = new Set();
+    const fallback = [];
+    root.querySelectorAll('[class*="DeleteIcon"], [data-tracking-click-viewid*="delete"]').forEach((icon) => {
+      const card = icon.closest('[class*="MaterialModalButton"]') || icon.parentElement;
+      if (!card || seen.has(card)) return;
+      seen.add(card);
+      fallback.push(card);
+    });
+    return fallback;
   }
 
   async function deleteImagesExceptFirst(boxes) {
@@ -262,26 +341,204 @@
     }
   }
 
-  function findCarouselUploadInput() {
-    const upload = document.querySelector(
-      '[data-tracking-click-viewid="carousel_img_localfile_upload"]',
-    );
-    return findFileInputNear(upload || findCarouselRoot());
+  function findTextClickable(root, pattern, maxLen = 24) {
+    if (!root) return null;
+    const nodes = root.querySelectorAll('a, button, span, div, label, [role="button"]');
+    for (const node of nodes) {
+      if (node.closest(`#${ROOT_ID}`)) continue;
+      const text = (node.textContent || '').replace(/\s+/g, '');
+      if (!text || text.length > maxLen) continue;
+      if (pattern.test(text)) return node;
+    }
+    return null;
   }
 
+  function findFileInputInScope(scope) {
+    if (!scope) return null;
+    const inputs = [...scope.querySelectorAll('input[type=file]')].filter(
+      (el) => !el.closest(`#${ROOT_ID}`) && !el.disabled,
+    );
+    return inputs[0] || null;
+  }
+
+  function findCarouselUploadInput() {
+    const root = findCarouselRoot();
+    const tracked = document.querySelector(
+      '#picture [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
+      '#basic\\.carousel_gallery [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
+      '[data-tracking-click-viewid="carousel_img_localfile_upload"]',
+    );
+    const near = findFileInputNear(tracked);
+    if (near) return near;
+
+    const scoped = findFileInputInScope(root)
+      || findFileInputInScope(document.querySelector('#picture'))
+      || findFileInputInScope(document.querySelector('#basic\\.carousel_gallery'));
+    if (scoped) return scoped;
+
+    const textBtn = findTextClickable(root, /本地上传|上传图片/);
+    return findFileInputNear(textBtn);
+  }
+
+  async function ensureCarouselUploadInput() {
+    let input = findCarouselUploadInput();
+    if (input) return input;
+
+    const root = findCarouselRoot();
+    const textBtn = findTextClickable(root, /本地上传|上传图片/);
+    if (textBtn) {
+      triggerClick(textBtn);
+      await sleep(300);
+    }
+    return waitFor(() => findCarouselUploadInput(), 8000);
+  }
+
+  function findDetailRoot() {
+    return document.querySelector('#detail_pic');
+  }
+
+  function isDetailImageSlot(el) {
+    if (!el || el.closest(`#${ROOT_ID}`)) return false;
+    const text = (el.textContent || '').replace(/\s+/g, '');
+    return /预览/.test(text) && /更换/.test(text) && text.length <= 24;
+  }
+
+  function getDetailImageSlotContainer(el) {
+    if (!el) return null;
+    if (el.matches('[class*="ImageWithRemark"][class*="imageContainer"]')) return el;
+    return el.querySelector('[class*="ImageWithRemark"][class*="imageContainer"]') || el;
+  }
+
+  function getDetailImageSlots() {
+    const root = findDetailRoot();
+    if (!root || root.closest(`#${ROOT_ID}`)) return [];
+
+    const slots = [];
+    const seen = new Set();
+    const add = (el) => {
+      const container = getDetailImageSlotContainer(el);
+      if (!container || seen.has(container) || !root.contains(container)) return;
+      seen.add(container);
+      slots.push(container);
+    };
+
+    root.querySelectorAll('[class*="ImageWithRemark"][class*="imageContainer"]').forEach(add);
+    if (slots.length) return slots;
+
+    root.querySelectorAll('[class*="Grid_rowWrap"] > div').forEach((div) => {
+      if (div.querySelector('[class*="ImageWithRemark"]')) add(div);
+      else if (isDetailImageSlot(div)) add(div);
+    });
+    if (slots.length) return slots;
+
+    root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]').forEach((img) => {
+      add(img.closest('[class*="ImageWithRemark"]') || img.closest('[class*="Grid_rowWrap"] > div') || img.parentElement);
+    });
+    return slots.filter(Boolean);
+  }
+
+  /** @deprecated use getDetailImageSlots */
   function getDetailImageItems() {
-    const root = document.querySelector('#detail_pic');
-    if (!root) return [];
-    return [...root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]')]
-      .map((img) => img.closest('[class*="item"], [class*="cell"], figure, div') || img.parentElement)
-      .filter(Boolean);
+    return getDetailImageSlots();
+  }
+
+  function findDetailDeleteInCard(card) {
+    const icon = card.querySelector('[class*="DeleteIcon_v2"], [class*="DeleteIcon"]');
+    if (icon) return icon;
+    return findDeleteButton(card);
+  }
+
+  function clickDeleteIconFast(del) {
+    if (!del) return false;
+    if (tryInvokeReactOnClick(del)) return true;
+    del.click();
+    return true;
+  }
+
+  async function deleteDetailSlotFast(card) {
+    const del = findDetailDeleteInCard(card);
+    if (!del) return false;
+    clickDeleteIconFast(del);
+    await sleep(DETAIL_DELETE_GAP_MS);
+    return true;
+  }
+
+  async function deleteDetailImagesExceptFirst() {
+    let deleted = 0;
+    for (let guard = 0; guard < 50; guard += 1) {
+      const slots = getDetailImageSlots();
+      if (slots.length <= 1) return deleted;
+      if (!(await deleteDetailSlotFast(slots[1]))) return deleted;
+      deleted += 1;
+    }
+    return deleted;
+  }
+
+  async function deleteLegacyDetailImages(count) {
+    let deleted = 0;
+    for (let i = 0; i < count; i += 1) {
+      const slots = getDetailImageSlots();
+      if (!slots.length) break;
+      if (!(await deleteDetailSlotFast(slots[0]))) break;
+      deleted += 1;
+    }
+    return deleted;
   }
 
   function findDetailUploadInput() {
     const root = document.querySelector('#detail_pic');
     if (!root) return null;
-    const upload = root.querySelector('[data-tracking-click-viewid*="upload"], [class*="upload"]');
-    return findFileInputNear(upload || root);
+    const upload = root.querySelector(
+      '[data-tracking-click-viewid*="upload"], [data-tracking-click-viewid*="localfile"], [class*="upload"]',
+    );
+    const near = findFileInputNear(upload);
+    if (near) return near;
+    const scoped = findFileInputInScope(root);
+    if (scoped) return scoped;
+    const textBtn = findTextClickable(root, /本地上传/);
+    return findFileInputNear(textBtn);
+  }
+
+  async function ensureDetailUploadInput() {
+    let input = findDetailUploadInput();
+    if (input) return input;
+    const root = document.querySelector('#detail_pic');
+    const textBtn = findTextClickable(root, /本地上传/);
+    if (textBtn) {
+      triggerClick(textBtn);
+      await sleep(300);
+    }
+    return waitFor(() => findDetailUploadInput(), 8000);
+  }
+
+  function probeFileMinEdge(file, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
+    return new Promise((resolve) => {
+      if (!file) {
+        resolve(false);
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      const finish = (ok) => {
+        img.onload = null;
+        img.onerror = null;
+        URL.revokeObjectURL(url);
+        resolve(ok);
+      };
+      img.onload = () => finish(Math.min(img.naturalWidth, img.naturalHeight) >= minEdge);
+      img.onerror = () => finish(false);
+      img.src = url;
+    });
+  }
+
+  async function filterFilesByMinEdge(files, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
+    const kept = [];
+    let skipped = 0;
+    for (const file of files) {
+      if (await probeFileMinEdge(file, minEdge)) kept.push(file);
+      else skipped += 1;
+    }
+    return { files: kept, skipped };
   }
 
   async function loadFilesFromManifest(rootHandle, paths) {
@@ -299,14 +556,20 @@
   async function stepCarousel(manifest, rootHandle, onProgress) {
     const step = createStepResult('carousel', '轮播图');
     step.total = manifest.images.carousel.length;
+    await focusPipelineSection(['#picture', '#basic.carousel_gallery']);
     onProgress('轮播图：删除旧图…');
     await deleteImagesExceptFirst(getCarouselImageBoxes());
+    await sleep(400);
     onProgress(`轮播图：上传 0/${step.total}…`);
-    const files = await loadFilesFromManifest(rootHandle, manifest.images.carousel);
+    const rawFiles = await loadFilesFromManifest(rootHandle, manifest.images.carousel);
+    const { files, skipped } = await filterFilesByMinEdge(rawFiles);
     if (!files.length) {
-      return finalizeStep(step, step.total ? 'failed' : 'skipped', '未读取到轮播图文件');
+      const reason = step.total
+        ? (skipped ? `有效图 0 张（跳过过小/占位 ${skipped}）` : '未读取到轮播图文件')
+        : '已跳过';
+      return finalizeStep(step, step.total ? 'failed' : 'skipped', reason);
     }
-    const input = await waitFor(() => findCarouselUploadInput(), 8000);
+    const input = await ensureCarouselUploadInput();
     if (!input) {
       return finalizeStep(step, 'failed', '未找到轮播图上传入口');
     }
@@ -314,7 +577,8 @@
     if (ok) {
       step.ok = files.length;
       await sleep(1500);
-      return finalizeStep(step, 'success', `上传 ${files.length}/${step.total} 张`);
+      const skipHint = skipped ? `，跳过过小/占位 ${skipped}` : '';
+      return finalizeStep(step, 'success', `上传 ${files.length}/${step.total} 张${skipHint}`);
     }
     step.fail = files.length;
     return finalizeStep(step, 'failed', '轮播图上传失败');
@@ -323,22 +587,38 @@
   async function stepDetail(manifest, rootHandle, onProgress) {
     const step = createStepResult('detail', '详情图');
     step.total = manifest.images.detail.length;
+    await focusPipelineSection(['#detail_pic']);
     onProgress('详情图：删除旧图…');
-    await deleteImagesExceptFirst(getDetailImageItems());
+    const deletedPre = await deleteDetailImagesExceptFirst();
+    const legacyRemain = getDetailImageSlots().length;
+    await sleep(400);
     onProgress(`详情图：上传 0/${step.total}…`);
-    const files = await loadFilesFromManifest(rootHandle, manifest.images.detail);
+    const rawFiles = await loadFilesFromManifest(rootHandle, manifest.images.detail);
+    const { files, skipped } = await filterFilesByMinEdge(rawFiles);
     if (!files.length) {
-      return finalizeStep(step, step.total ? 'failed' : 'skipped', '未读取到详情图文件');
+      const reason = step.total
+        ? (skipped ? `有效图 0 张（跳过过小/占位 ${skipped}）` : '未读取到详情图文件')
+        : '已跳过';
+      return finalizeStep(step, step.total ? 'failed' : 'skipped', reason);
     }
-    const input = await waitFor(() => findDetailUploadInput(), 8000);
+    const input = await ensureDetailUploadInput();
     if (!input) {
       return finalizeStep(step, 'failed', '未找到详情图上传入口');
     }
     const ok = assignFilesToInput(input, files);
     if (ok) {
       step.ok = files.length;
-      await sleep(1500);
-      return finalizeStep(step, 'success', `上传 ${files.length}/${step.total} 张`);
+      await sleep(1200);
+      let deletedPost = 0;
+      if (legacyRemain > 0) {
+        onProgress(`详情图：删除 ${legacyRemain} 张历史图…`);
+        deletedPost = await deleteLegacyDetailImages(legacyRemain);
+      }
+      await sleep(400);
+      const totalCleaned = deletedPre + deletedPost;
+      const skipHint = skipped ? `，跳过过小/占位 ${skipped}` : '';
+      const legacyHint = totalCleaned ? `，已清理历史 ${totalCleaned} 张` : '';
+      return finalizeStep(step, 'success', `上传 ${files.length}/${step.total} 张${skipHint}${legacyHint}`);
     }
     step.fail = files.length;
     return finalizeStep(step, 'failed', '详情图上传失败');
@@ -360,6 +640,8 @@
   }
 
   function findSpecGroupRoot(firstInput) {
+    const row = firstInput.closest('.goods-spec-row');
+    if (row) return row;
     const scope = firstInput.closest('#goods-spec-sku, #sku, #newSpec, .goods-sku-box') || document.body;
     let el = firstInput;
     while (el && el !== scope) {
@@ -391,89 +673,278 @@
     return roots;
   }
 
-  function findDeleteSpecTypeButton(groupRoot) {
-    const nodes = groupRoot.querySelectorAll('a, button, span, [role="button"]');
-    for (const node of nodes) {
+  function findAllDeleteSpecTypeButtons() {
+    const buttons = [];
+    document.querySelectorAll(
+      '#goods-spec-sku .goods-spec-row-right a, #spec .goods-spec-row-right a, ' +
+      '.goods-sku-box.goods-spec .goods-spec-row-right a, .goods-sku-box.goods-spec a',
+    ).forEach((node) => {
+      if (node.closest(`#${ROOT_ID}`)) return;
       const text = (node.textContent || '').replace(/\s+/g, '');
-      if (/删除规格类型/.test(text)) {
-        return node.closest('a, button, [role="button"]') || node;
-      }
-    }
-    return null;
+      if (/删除规格类型/.test(text)) buttons.push(node);
+    });
+    return dedupeElements(buttons);
   }
 
-  async function confirmDialogIfAny() {
-    await sleep(200);
-    const scopes = document.querySelectorAll('[class*="Modal"], [role="dialog"], [class*="modal"]');
-    for (const scope of scopes) {
-      if (scope.closest(`#${ROOT_ID}`)) continue;
-      const btn = [...scope.querySelectorAll('button')].find((b) => /确定|确认|是/.test(b.textContent || ''));
-      if (btn) {
-        triggerClick(btn);
-        await sleep(300);
-        return;
+  function findDeleteSpecTypeButton(groupRoot) {
+    if (groupRoot) {
+      const inRoot = groupRoot.querySelector('.goods-spec-row-right a, a[class*="BTN_outerWrapperLink"]');
+      if (inRoot && /删除规格类型/.test((inRoot.textContent || '').replace(/\s+/g, ''))) {
+        return inRoot;
+      }
+      const nodes = groupRoot.querySelectorAll('a, button, span, [role="button"]');
+      for (const node of nodes) {
+        const text = (node.textContent || '').replace(/\s+/g, '');
+        if (/删除规格类型/.test(text)) {
+          return node.closest('a, button, [role="button"]') || node;
+        }
       }
     }
+    const all = findAllDeleteSpecTypeButtons();
+    return all.length ? all[all.length - 1] : null;
+  }
+
+  async function confirmDialogIfAny(options = {}) {
+    const { preferDelete = false } = options;
+    await sleep(280);
+    const modals = document.querySelectorAll(
+      '[class*="MDL_outerWrapper"], [class*="Modal"], [role="dialog"], [class*="modal"]',
+    );
+    for (const modal of modals) {
+      if (modal.closest(`#${ROOT_ID}`)) continue;
+      const style = getComputedStyle(modal);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+      const bodyText = (modal.textContent || '').replace(/\s+/g, '');
+      if (!/确认|确定|删除该规格|要删除|丢失/.test(bodyText)) continue;
+
+      const clickables = [
+        ...modal.querySelectorAll(
+          'button, a, span, [role="button"], [class*="BTN_outerWrapperBtn"], [class*="BTN_outerWrapperLink"]',
+        ),
+      ].filter((el) => !el.closest(`#${ROOT_ID}`));
+
+      const pick = (pattern) => clickables.find((el) => pattern.test((el.textContent || '').replace(/\s+/g, '')));
+
+      if (preferDelete) {
+        const delBtn = pick(/^删除$/);
+        if (delBtn) {
+          triggerClick(delBtn);
+          await sleep(350);
+          return true;
+        }
+      }
+
+      const okBtn = pick(/^(确定|确认|是)$/);
+      if (okBtn) {
+        triggerClick(okBtn);
+        await sleep(350);
+        return true;
+      }
+
+      const delBtn = pick(/^删除$/);
+      if (delBtn) {
+        triggerClick(delBtn);
+        await sleep(350);
+        return true;
+      }
+    }
+    return false;
   }
 
   async function deleteAllSpecTypes() {
     for (let guard = 0; guard < 20; guard += 1) {
-      const roots = getAllSpecGroupRoots();
-      if (!roots.length) return;
-      const root = roots[roots.length - 1];
-      const del = findDeleteSpecTypeButton(root);
-      if (!del) return;
-      triggerClick(del);
-      await confirmDialogIfAny();
+      const dels = findAllDeleteSpecTypeButtons();
+      if (!dels.length) {
+        const roots = getAllSpecGroupRoots();
+        if (!roots.length) return;
+        const del = findDeleteSpecTypeButton(roots[roots.length - 1]);
+        if (!del) return;
+        triggerClick(del);
+      } else {
+        triggerClick(dels[dels.length - 1]);
+      }
+      await confirmDialogIfAny({ preferDelete: true });
       await sleep(450);
     }
   }
 
   function findAddSpecTypeButton() {
-    const scopes = document.querySelectorAll('#goods-spec-sku, #sku, #newSpec, .goods-sku-box');
-    for (const scope of scopes) {
-      const nodes = scope.querySelectorAll('a, button, span, [role="button"]');
-      for (const node of nodes) {
+    const specBox = document.querySelector('.goods-sku-box.goods-spec, #spec .goods-sku-box.goods-spec');
+    if (specBox) {
+      const btn = [...specBox.querySelectorAll('button[data-testid="beast-core-button"], button, a')].find((node) => {
+        if (node.closest(`#${ROOT_ID}`)) return false;
         const text = (node.textContent || '').replace(/\s+/g, '');
-        if (/添加规格类型|添加规格/.test(text)) {
-          return node.closest('a, button, [role="button"]') || node;
+        return /添加规格类型\s*\(\d+\/\d+\)/.test(text) || /^添加规格类型$/.test(text);
+      });
+      if (btn) return btn;
+    }
+    const scopes = document.querySelectorAll('#goods-spec-sku, #spec, #newSpec, .goods-sku-box.goods-spec');
+    for (const scope of scopes) {
+      const nodes = scope.querySelectorAll('button[data-testid="beast-core-button"], a, button, span, [role="button"]');
+      for (const node of nodes) {
+        if (node.closest(`#${ROOT_ID}`)) continue;
+        const text = (node.textContent || '').replace(/\s+/g, '');
+        if (/添加规格类型\s*\(\d+\/\d+\)/.test(text) || /^添加规格类型$/.test(text)) {
+          return node.closest('button, a, [role="button"]') || node;
         }
       }
     }
     return null;
   }
 
+  function getSpecTypeRows() {
+    return [...document.querySelectorAll(
+      '#spec .goods-spec-row, .goods-sku-box.goods-spec .goods-spec-row',
+    )].filter((row) => !row.closest(`#${ROOT_ID}`));
+  }
+
+  function findSpecTypeDropdown(row) {
+    if (!row) return null;
+    const block = row.querySelector('[id*="parentSpecArr"][id*="spec_id"], [id*="spec_id"]')
+      || row.querySelector('.goods-spec-row-left');
+    if (!block) return null;
+    const input = block.querySelector(
+      '[class*="ST_selectValueSingle"] input, [class*="ST_inputWrapper"] input, [class*="IPT_inputWrapper"] input, input',
+    );
+    if (input) return input;
+    return block.querySelector(
+      '[class*="ST_outerWrapper"], [class*="ST_selectValueSingle"], [class*="ST_inputWrapper"], [class*="IPT_inputWrapper"]',
+    );
+  }
+
+  function readSpecTypeDropdownValue(row) {
+    const dropdown = findSpecTypeDropdown(row);
+    if (!dropdown) return '';
+    if (dropdown instanceof HTMLInputElement) return pieNormText(dropdown.value);
+    const input = dropdown.querySelector?.('input');
+    if (input) return pieNormText(input.value);
+    return pieNormText(dropdown.textContent);
+  }
+
+  function findSpecTypeDropdownTrigger(row) {
+    if (!row) return null;
+    const block = row.querySelector('[id*="parentSpecArr"][id*="spec_id"], [id*="spec_id"]')
+      || row.querySelector('.goods-spec-row-left');
+    if (!block) return null;
+    return block.querySelector(
+      '[class*="ST_outerWrapper"], [class*="IPT_inputWrapper"][class*="ST_inputWrapper"], ' +
+      '[class*="ST_selectValueSingle"], [class*="IPT_inputWrapper"]',
+    ) || findSpecTypeDropdown(row);
+  }
+
+  function getOpenSpecTypeDropdowns() {
+    return [...document.querySelectorAll(
+      '[data-testid="beast-core-portal"][class*="ST_dropdown"], [class*="ST_dropdown"][class*="PT_outerWrapper"], [class*="ST_dropdown"]',
+    )].filter((el) => {
+      if (el.closest(`#${ROOT_ID}`)) return false;
+      const style = getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    });
+  }
+
+  function isExactSpecTypeOptionNode(node, target) {
+    if (!node || node.closest(`#${ROOT_ID}, #sku, [class*="TB_tableWrapper"]`)) return false;
+    const text = pieNormText(node.textContent);
+    if (text !== target) return false;
+    return ![...node.children].some((child) => pieNormText(child.textContent) === target);
+  }
+
   function findSpecTypeOption(typeLabel) {
     const target = pieNormText(typeLabel);
-    const scopes = document.querySelectorAll(
-      '[class*="Modal"], [role="dialog"], [class*="modal"], [class*="Drawer"], [role="listbox"], [class*="popover"], [class*="Popover"]',
-    );
-    const searchNodes = (root) => {
-      const nodes = root.querySelectorAll('li, div, span, a, button, [role="option"], [role="menuitem"]');
-      for (const node of nodes) {
-        const text = pieNormText(node.textContent);
-        if (text === target) return node.closest('li, a, button, [role="option"]') || node;
+    const dropdowns = getOpenSpecTypeDropdowns();
+
+    for (const dropdown of dropdowns) {
+      const matches = [];
+      dropdown.querySelectorAll('li, div, span, a, button, [role="option"], [class*="ST_item"], [class*="item"]').forEach((node) => {
+        if (!isExactSpecTypeOptionNode(node, target)) return;
+        matches.push(node);
+      });
+      if (matches.length) {
+        matches.sort((a, b) => a.children.length - b.children.length || a.textContent.length - b.textContent.length);
+        return matches[0];
       }
-      return null;
-    };
-    for (const scope of scopes) {
-      if (scope.closest(`#${ROOT_ID}`)) continue;
-      const hit = searchNodes(scope);
-      if (hit) return hit;
+
+      const scrollBody = dropdown.querySelector('[class*="scroll"], [class*="Scroll"], [class*="list"]') || dropdown;
+      scrollBody.querySelectorAll('div, span, li').forEach((node) => {
+        if (node.closest(`#${ROOT_ID}, #sku`)) return;
+        if (pieNormText(node.textContent) !== target) return;
+        if ([...node.children].some((c) => pieNormText(c.textContent) === target)) return;
+        matches.push(node);
+      });
+      if (matches.length) {
+        matches.sort((a, b) => a.textContent.length - b.textContent.length);
+        return matches[0];
+      }
     }
-    return searchNodes(document.body);
+
+    for (const dropdown of dropdowns) {
+      const nodes = dropdown.querySelectorAll('*');
+      for (const node of nodes) {
+        if (!isExactSpecTypeOptionNode(node, target)) continue;
+        return node;
+      }
+    }
+    return null;
+  }
+
+  async function fillSpecTypeDropdown(row, typeLabel) {
+    const target = pieNormText(typeLabel);
+    if (!target) return false;
+
+    const block = row.querySelector('[id*="parentSpecArr"][id*="spec_id"], [id*="spec_id"]');
+    const trigger = findSpecTypeDropdownTrigger(row);
+    if (!trigger) return false;
+
+    triggerClick(trigger);
+    await sleep(280);
+    await waitFor(() => (getOpenSpecTypeDropdowns().length > 0 ? true : null), 2500, 80);
+
+    const input = block?.querySelector(
+      '[class*="ST_inputWrapper"] input, [class*="IPT_inputWrapper"] input, input',
+    );
+    if (input instanceof HTMLInputElement) {
+      input.focus();
+      setInputValue(input, target);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(180);
+    }
+
+    const option = await waitFor(() => findSpecTypeOption(typeLabel), 4000, 80);
+    if (option) {
+      triggerClick(option);
+      await sleep(350);
+      if (readSpecTypeDropdownValue(row) === target || querySpecInputs(row).length > 0) return true;
+    }
+
+    if (input instanceof HTMLInputElement) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      input.blur();
+      await sleep(350);
+      return readSpecTypeDropdownValue(row) === target || querySpecInputs(row).length > 0;
+    }
+
+    return false;
   }
 
   async function selectSpecType(typeLabel) {
     const addBtn = findAddSpecTypeButton();
     if (!addBtn) return false;
+
+    const rowsBefore = getSpecTypeRows().length;
     triggerClick(addBtn);
-    await sleep(400);
-    const option = await waitFor(() => findSpecTypeOption(typeLabel), 5000);
-    if (!option) return false;
-    triggerClick(option);
     await sleep(500);
-    return true;
+
+    const row = await waitFor(() => {
+      const rows = getSpecTypeRows();
+      if (rows.length > rowsBefore) return rows[rows.length - 1];
+      if (rows.length) return rows[rows.length - 1];
+      return null;
+    }, 5000);
+    if (!row) return false;
+
+    return fillSpecTypeDropdown(row, typeLabel);
   }
 
   function setInputValue(input, value) {
@@ -554,6 +1025,11 @@
   }
 
   function getLatestSpecGroupFirstInput() {
+    const rows = getSpecTypeRows();
+    if (rows.length) {
+      const inputs = querySpecInputs(rows[rows.length - 1]);
+      if (inputs.length) return inputs[0];
+    }
     const roots = getAllSpecGroupRoots();
     if (!roots.length) return null;
     const inputs = querySpecInputs(roots[roots.length - 1]);
@@ -562,6 +1038,7 @@
 
   async function stepSpecs(manifest, onProgress) {
     const steps = [];
+    await focusPipelineSection(['#goods-spec-sku', '#spec', '.goods-sku-box.goods-spec']);
     onProgress('规格：删除已有规格类型…');
     await deleteAllSpecTypes();
     await sleep(500);
@@ -638,9 +1115,94 @@
     return document.querySelector('[class*="Modal"] input[type=file], [role="dialog"] input[type=file]');
   }
 
+  function findExcelConfirmEditButton(scope) {
+    if (!scope) return null;
+    const buttons = scope.querySelectorAll(
+      'button, a, [role="button"], [class*="BTN_outerWrapperBtn"], [class*="BTN_outerWrapper"]',
+    );
+    for (const btn of buttons) {
+      if (btn.closest(`#${ROOT_ID}`)) continue;
+      const text = (btn.textContent || '').replace(/\s+/g, '');
+      if (text === '确认编辑') return btn.closest('button, a, [role="button"]') || btn;
+    }
+    return null;
+  }
+
+  function findExcelConfirmReviewModal() {
+    const scopes = document.querySelectorAll(
+      '[class*="MDL_outerWrapper"], [class*="Modal"], [role="dialog"], [class*="modal"]',
+    );
+    for (const scope of scopes) {
+      if (scope.closest(`#${ROOT_ID}`)) continue;
+      const style = getComputedStyle(scope);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const text = (scope.textContent || '').replace(/\s+/g, '');
+      if (/确认编辑项|请仔细核对下表|本次涉及的编辑项/.test(text)) return scope;
+    }
+    return null;
+  }
+
+  function findExcelPrimaryConfirmButton() {
+    const tracked = document.querySelector(
+      'button[data-tracking-viewid="confirm_edit"][class*="BTN_primary"]',
+    );
+    if (tracked && !tracked.closest(`#${ROOT_ID}`)) return tracked;
+
+    const footer = document.querySelector('[class*="BatchEditSkuModal_confirmFooter"]');
+    if (footer) {
+      const btn = findExcelConfirmEditButton(footer);
+      if (btn) return btn;
+    }
+
+    const modal = findExcelConfirmReviewModal();
+    return modal ? findExcelConfirmEditButton(modal) : null;
+  }
+
+  function findExcelPopoverConfirmButton() {
+    const popover = document.querySelector(
+      '[data-testid="beast-core-portal-main"][class*="PP_withConfirmPopoverMain"], ' +
+      '[class*="PP_popoverWithConfirm"]',
+    );
+    if (popover && !popover.closest(`#${ROOT_ID}`)) {
+      const btn = popover.querySelector('button[data-tracking-viewid="confirm_edit"]')
+        || findExcelConfirmEditButton(popover);
+      if (btn) return btn;
+    }
+
+    const portals = document.querySelectorAll(
+      '[class*="PP_popoverWithConfirm"], [class*="PT_popover"][class*="PP_outerWrapper"]',
+    );
+    for (const scope of portals) {
+      if (scope.closest(`#${ROOT_ID}`)) continue;
+      const text = (scope.textContent || '').replace(/\s+/g, '');
+      if (!/规格编码|空值|确认修改/.test(text)) continue;
+      const btn = scope.querySelector('button[data-tracking-viewid="confirm_edit"]')
+        || findExcelConfirmEditButton(scope);
+      if (btn) return btn;
+    }
+    return null;
+  }
+
+  async function confirmExcelImportDialogs(onProgress) {
+    onProgress('Excel：确认编辑项…');
+    const mainBtn = await waitFor(() => findExcelPrimaryConfirmButton(), 15000, 200);
+    if (!mainBtn) return false;
+    triggerClick(mainBtn);
+    await sleep(350);
+
+    onProgress('Excel：确认空值提示…');
+    const warnBtn = await waitFor(() => findExcelPopoverConfirmButton(), 8000, 120);
+    if (warnBtn) {
+      triggerClick(warnBtn);
+      await sleep(350);
+    }
+    return true;
+  }
+
   async function stepExcel(manifest, rootHandle, onProgress) {
     const step = createStepResult('excel', 'Excel导入');
     const excelPath = manifest.excel || '成本表.xlsx';
+    await focusPipelineSection(['#goods-spec-sku', '#sku']);
     onProgress('Excel：打开批量编辑…');
     const entry = findSkuExcelEntry();
     if (!entry) {
@@ -665,11 +1227,19 @@
       return finalizeStep(step, 'failed', 'Excel 文件注入失败');
     }
 
-    await sleep(2000);
+    await sleep(1500);
+    const confirmed = await confirmExcelImportDialogs(onProgress);
+    if (!confirmed) {
+      return finalizeStep(step, 'partial', '已上传，未找到确认编辑弹窗');
+    }
+
+    await sleep(800);
     const modalGone = await waitFor(() => {
-      const scopes = document.querySelectorAll('[class*="Modal"], [role="dialog"]');
+      if (findExcelConfirmReviewModal()) return null;
+      const scopes = document.querySelectorAll('[class*="Modal"], [role="dialog"], [class*="MDL_outerWrapper"]');
       for (const scope of scopes) {
-        if (/Excel批量编辑规格/.test((scope.textContent || '').replace(/\s+/g, ''))) return null;
+        const text = (scope.textContent || '').replace(/\s+/g, '');
+        if (/Excel批量编辑规格|确认编辑项/.test(text)) return null;
       }
       return true;
     }, 30000, 300);
@@ -677,9 +1247,83 @@
     step.ok = 1;
     step.total = 1;
     if (modalGone) {
-      return finalizeStep(step, 'success', '导入完成（未点击保存草稿）');
+      return finalizeStep(step, 'success', '导入完成（已确认编辑，未点保存草稿）');
     }
     return finalizeStep(step, 'partial', '已上传，等待平台更新超时');
+  }
+
+  function getSkuQuantityInputs() {
+    const root = document.querySelector('#sku, #goods-spec-sku');
+    if (!root || root.closest(`#${ROOT_ID}`)) return [];
+    return [...root.querySelectorAll(
+      'td.sku-input.quantity input, td.quantity.is_create input, td[class*="quantity"] input',
+    )].filter((input) => input instanceof HTMLInputElement && !input.closest(`#${ROOT_ID}`));
+  }
+
+  function isStockInputEmpty(input) {
+    return String(input.value ?? '').trim() === '';
+  }
+
+  async function commitStockInput(input, value) {
+    input.focus();
+    setInputValue(input, value);
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
+    input.blur();
+    await sleep(40);
+  }
+
+  async function fillEmptySkuQuantity() {
+    ensureSkuTableHeight();
+    await sleep(300);
+
+    let filled = 0;
+    const seen = new Set();
+    const viewport = getSkuScrollViewport();
+
+    const fillVisible = async () => {
+      for (const input of getSkuQuantityInputs()) {
+        if (seen.has(input) || !isStockInputEmpty(input)) continue;
+        seen.add(input);
+        await commitStockInput(input, '0');
+        filled += 1;
+      }
+    };
+
+    if (!viewport) {
+      await fillVisible();
+      return filled;
+    }
+
+    const step = Math.max(viewport.clientHeight * 0.75, SKU_ROW_HEIGHT_PX);
+    const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    for (let scrollTop = 0; scrollTop <= maxScroll + 1; scrollTop += step) {
+      viewport.scrollTop = scrollTop;
+      await sleep(80);
+      await fillVisible();
+    }
+    viewport.scrollTop = 0;
+    return filled;
+  }
+
+  async function stepSkuStock(onProgress) {
+    const step = createStepResult('sku-stock', 'SKU库存');
+    await focusPipelineSection(['#goods-spec-sku', '#sku']);
+    onProgress('SKU：补全空库存…');
+
+    const emptyBefore = getSkuQuantityInputs().filter(isStockInputEmpty).length;
+    if (!emptyBefore) {
+      return finalizeStep(step, 'skipped', '库存均已填写');
+    }
+    step.total = emptyBefore;
+
+    const filled = await fillEmptySkuQuantity();
+    step.ok = filled;
+    step.fail = Math.max(0, step.total - filled);
+    return finalizeStep(
+      step,
+      filled >= step.total ? 'success' : filled > 0 ? 'partial' : 'failed',
+      `空库存补 0：${filled}/${step.total} 行`,
+    );
   }
 
   function getSkuScrollViewport() {
@@ -783,11 +1427,37 @@
     return false;
   }
 
-  function findPreviewDeleteButton(cell) {
+  function findPreviewDeleteInCell(cell) {
+    const icon = cell.querySelector('[class*="DeleteIcon_v2"], [class*="DeleteIcon"]');
+    if (icon) return icon;
     const preview = cell.querySelector(
       '[data-tracking-click-viewid="el_specification_batch_modification_preview_picture"]',
-    ) || cell;
-    return findDeleteButton(preview) || findDeleteButton(cell);
+    );
+    if (preview) {
+      const inPreview = preview.querySelector('[class*="DeleteIcon_v2"], [class*="DeleteIcon"]');
+      if (inPreview) return inPreview;
+    }
+    return findDeleteButton(preview || cell);
+  }
+
+  async function deletePreviewInCellFast(cell) {
+    if (!previewCellHasImage(cell)) return false;
+    const del = findPreviewDeleteInCell(cell);
+    if (!del) return false;
+    clickDeleteIconFast(del);
+    await sleep(PREVIEW_DELETE_GAP_MS);
+    return true;
+  }
+
+  async function deletePreviewInCells(cells) {
+    let deleted = 0;
+    for (let guard = 0; guard < cells.length + 10; guard += 1) {
+      const withImage = cells.filter((cell) => previewCellHasImage(cell));
+      if (!withImage.length) return deleted;
+      if (!(await deletePreviewInCellFast(withImage[0]))) return deleted;
+      deleted += 1;
+    }
+    return deleted;
   }
 
   function findPreviewUploadTarget(cell) {
@@ -796,18 +1466,6 @@
     );
     if (preview) return preview;
     return cell.querySelector('[data-tracking-click-viewid*="preview"], [class*="upload"]') || cell;
-  }
-
-  async function deletePreviewInCells(cells) {
-    for (const cell of cells) {
-      if (!previewCellHasImage(cell)) continue;
-      const del = findPreviewDeleteButton(cell);
-      if (del) {
-        triggerClick(del);
-        await sleep(250);
-        await confirmDialogIfAny();
-      }
-    }
   }
 
   function chunkPreviewEntries(previewList) {
@@ -837,8 +1495,9 @@
       return finalizeStep(step, 'skipped', 'manifest 无预览图');
     }
 
+    await focusPipelineSection(['#goods-spec-sku', '#sku']);
     ensureSkuTableHeight();
-    await sleep(400);
+    await sleep(200);
 
     const chunks = chunkPreviewEntries(entries);
     let ok = 0;
@@ -1030,6 +1689,7 @@
       }
 
       steps.push(await stepExcel(manifest, rootHandle, onProgress));
+      steps.push(await stepSkuStock(onProgress));
       steps.push(await stepPreview(manifest, rootHandle, onProgress));
     } catch (err) {
       steps.push(createStepResult('fatal', '致命错误'));

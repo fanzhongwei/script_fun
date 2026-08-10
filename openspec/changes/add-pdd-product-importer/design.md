@@ -85,10 +85,19 @@ validate → carousel → detail → spec_clear → spec_add[*] → excel → pr
 ### 5. 轮播图 / 详情图：删旧留一 + 一次全量上传
 
 - **决策**：
-  - 轮播：枚举 `#picture` / `MaterialModalButton_v2_imageBox`，index ≥ 1 从后往前点删除
-  - 详情：枚举 `#detail_pic` 内 `el_preview_business_details` 对应项，同上
-  - 上传：读 manifest 全部路径 → `File[]` → 找 `carousel_img_localfile_upload` 或详情区 `input[type=file]` → **一次** `DataTransfer` 注入全部文件（平台支持多选/多文件一次提交）
-- **理由**：目标页常有模板占位图，保留第 1 张避免空态异常；轮播与详情均支持一次上传所有图，无需逐张循环
+  - 轮播：枚举 `#picture` / `#basic.carousel_gallery` 内 `MaterialModalButton_v2_imageBox` / `imageWrapper` / 含 `DeleteIcon` 的卡片，index ≥ 1 从后往前点删除；删除优先点 `[class*="DeleteIcon"]`（右上角叉，无需依赖「删除」文案）
+  - 详情：枚举 `#detail_pic` 内 `el_preview_business_details` 对应项，同上（删除同样优先 `DeleteIcon`）
+  - 上传前过滤：manifest 文件解码后短边 &lt; 480px 或识别为占位图的跳过，并在步骤详情中记录跳过数
+  - 上传：过滤后的 `File[]` → 找 `carousel_img_localfile_upload` / 文案「本地上传」/ `#picture input[type=file]`（详情区同理，可先点「本地上传」再取 input）→ **一次** `DataTransfer` 注入；满槽时先删后等入口出现
+- **理由**：目标页常有模板占位图，保留第 1 张避免空态异常；满槽时本地上传入口常隐藏；「文本暂无预览」占位图为真实小图 URL（如 192px），DOM 文案过滤不够，需尺寸门槛
+
+### 5.1 无效图过滤（导出 + 导入）
+
+- **决策**：
+  - 门槛：`PDD_MIN_IMAGE_EDGE_PX = 480`（与平台轮播「宽高均大于 480」对齐，详情/轮播共用）
+  - 导出：采集时丢弃 DOM 文案含「文本暂无预览|暂无预览」的项；对已加载 `img` 用 `naturalWidth/Height` 过滤；对背景图 URL 用 `Image` 探测短边
+  - 导入：读 File 后用 `createImageBitmap` / `Image` 探测，不合格跳过再上传
+- **理由**：占位图像素内嵌文字，仅 DOM textContent 匹配会漏网；尺寸门槛便宜且对齐平台校验
 
 ### 6. 规格：删旧 → 加类型 → 填值
 
@@ -151,4 +160,5 @@ validate → carousel → detail → spec_clear → spec_add[*] → excel → pr
 
 ## Open Questions
 
-- 预览图删除入口的具体 DOM（hover 删除 vs 弹层删除）——实现 spike 确认，不改变 spec 行为
+- 预览图删除入口的具体 DOM（hover 删除 vs 弹层删除）——已确认卡片右上角 `DeleteIcon` 可直接点删
+- 规格类型名「规格」在目标页无匹配——属源 manifest / 类目差异，不在本修复范围（仍 fatal abort）

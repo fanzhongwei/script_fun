@@ -49,10 +49,11 @@ Tampermonkey 用户脚本：在拼多多商家后台商品编辑页，从 [页�
 | 步骤 | 行为 |
 |------|------|
 | 轮播图 | 保留第 1 张，删其余，**一次上传** manifest 全部轮播图 |
-| 详情图 | 同上 |
+| 详情图 | 保留第 1 张占位避免空态 → 上传 manifest 全部 → **再删保留的首张旧图** |
 | 规格 | 删全部旧规格 → 按 manifest 顺序添加规格类型并填值；**类型名不匹配则中断** |
-| Excel | 打开「Excel 批量编辑规格」导入 `成本表.xlsx`，**不点保存草稿** |
-| 预览图 | 校验 SKU 表格高度（未正确则设为 N×70px）→ 每 12 张一批上传；有旧预览先删 |
+| Excel | 打开「Excel 批量编辑规格」导入 → 两次「确认编辑」 |
+| SKU库存 | Excel 导入后，规格表 **库存** 列为空的行自动填 **0** |
+| 预览图 | 校验 SKU 表格高度 → 每 12 张一批上传 |
 
 ### 5. 汇总弹窗
 
@@ -75,11 +76,11 @@ tampermonkey/pdd_product_importer/
 
 ### Q2：规格类型匹配失败中断？
 
-manifest 中 `typeLabel` 须与目标页「添加规格类型」选择器选项 **trim 后全等**。请从源商品重新导出以更新 manifest，或手动在源页确认规格类型名称。
+manifest 中 `typeLabel` 须与目标页规格类型 **ST 下拉框** 显示值 trim 后全等（如「颜色」「尺码」）。请从源商品 **重新一键导出** 以更新 manifest；勿使用旧包中错误的「规格」占位名。
 
 ### Q3：预览图如何分批上传？
 
-与 exporter 一致：第 1 行本地上传可选 12 张，第 13 行再选 12 张，依此类推。上传前若该行已有预览图会先删除（支持重复导入）。
+与 exporter 一致：第 1 行本地上传可选 12 张，第 13 行再选 12 张，依此类推。上传前若该行已有预览图会先删除（与详情图相同：直接点 `DeleteIcon`，40ms 间隔，不弹确认框，支持重复导入）。
 
 ### Q4：SKU 表格高度是什么？
 
@@ -87,20 +88,38 @@ manifest 中 `typeLabel` 须与目标页「添加规格类型」选择器选项 
 
 ### Q5：Excel 导入后需要保存草稿吗？
 
-不需要。平台会自动更新规格数据；最终价格请用 price_calculator 重新算价并回填。
+不需要。上传后会自动点击「确认编辑项」弹窗及空值提示上的「确认编辑」；平台更新规格后直接进入预览图步骤。最终价格请用 price_calculator 重新算价并回填。
 
 ### Q6：轮播/详情图为什么保留第一张？
 
-避免清空后页面空态异常；第 2 张起会被 manifest 中的图片替换。
+轮播图：避免清空后页面空态异常；第 2 张起会被 manifest 中的图片替换。
 
-### Q7：DOM 依赖说明（实现参考）
+详情图：上传前同样暂留第 1 张避免空态；**上传成功后会自动删除该首张旧图**，最终只保留 manifest 中的详情图。
 
-- 预览图删除：预览 cell 内删除/关闭控件（`findDeleteButton`）
-- Excel 导入：弹窗内 `input[type=file]` 或「导入/上传 Excel」按钮
+### Q7：各步骤会滚动到对应区域吗？
+
+会。轮播 → `#picture`；详情 → `#detail_pic`；规格 → `#spec`；Excel/预览 → `#sku`，便于 SPA 懒加载渲染目标 DOM。
+
+### Q8：提示「未找到轮播图上传入口」？
+
+满槽（如 10/10）时「本地上传」常会隐藏。脚本会先点卡片右上角删除叉（`DeleteIcon`）腾出槽位，再找 `carousel_img_localfile_upload` /「本地上传」/ 区域内 `input[type=file]`。若仍失败，请确认已滚动到「商品基本信息」轮播区，并反馈汇总报告。
+
+### Q9：详情图提示尺寸不符 / 假成功？
+
+常见原因是源商品详情混入了「文本暂无预览」占位小图（短边 &lt; 480px）。请升级 image_exporter 后**重新一键导出**；导入器也会在上传前跳过短边 &lt; 480px 的文件，并在步骤详情标明跳过数。
+
+### Q10：DOM 依赖说明（实现参考）
+
+- 图片删除：优先 `[class*="DeleteIcon"]`（右上角叉）
+- 轮播上传：`carousel_img_localfile_upload` /「本地上传」/ `#picture` 内 file input
+- 规格删除：`.goods-spec-row-right` 内「删除规格类型」→ 确认弹窗点 **删除**
+- 详情删除：`ImageWithRemark_v2_imageContainer` 内 `DeleteIcon_v2`（右上角叉）
+- 规格添加：点「添加规格类型(1/2)」→ 新行 ST 下拉框（`#spec.parentSpecArr[n].spec_id`）选/填 typeLabel → 再批量填规格值
+- Excel 导入：`button[data-tracking-viewid="confirm_edit"]`（BatchEditSkuModal 页脚）→ Popover `PP_popoverWithConfirm` 内再次确认
 - 规格类型：添加规格后列表项文本全等匹配
 
 若平台改版导致失败，请反馈页面截图与汇总报告。
 
-### Q8：如何卸载？
+### Q11：如何卸载？
 
 在 Tampermonkey 管理面板中禁用或删除「拼多多商品包导入器」即可。

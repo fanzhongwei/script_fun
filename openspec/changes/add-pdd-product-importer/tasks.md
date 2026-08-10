@@ -52,3 +52,46 @@
 - [x] 8.1 录制预览图删除按钮 DOM 样本
 - [x] 8.2 确认 Excel 弹窗「导入」按钮文案与 file input
 - [x] 8.3 确认规格类型选择器（标准/自定义）DOM 与匹配方式
+
+## 9. 修复：无效图过滤 + 轮播上传入口
+
+- [x] 9.1 image_exporter：轮播/详情采集过滤 DOM 占位文案与短边 &lt; 480px（含 URL 探测）
+- [x] 9.2 image_exporter：更新 README（占位图/尺寸过滤说明）
+- [x] 9.3 importer：删除优先 `DeleteIcon`；轮播卡片选择器兼容 imageBox/imageWrapper
+- [x] 9.4 importer：轮播/详情上传入口多策略定位（tracking /「本地上传」/ 区域内 file input），满槽删后再等
+- [x] 9.5 importer：上传前过滤短边 &lt; 480px 文件，步骤详情记录跳过数
+- [x] 9.6 importer：更新 README FAQ；语法自检
+
+## 10. 修复：详情删首张 + 规格 DOM + 滚动定位
+
+- [x] 10.1 详情图：上传成功后删除保留的首张旧图；增强详情卡片 DeleteIcon 识别
+- [x] 10.2 规格：`.goods-spec-row-right` 删除 + `添加规格类型(1/2)` 按钮
+- [x] 10.3 各步骤 `scrollIntoView` 定位对应模块
+- [x] 10.4 image_exporter：修复 typeLabel 误导出为「规格」
+
+## 11. 修复：详情槽位删除 + 规格确认弹窗
+
+- [x] 11.1 详情：`Grid_rowWrap > div` 槽位识别（「预览 更换 N」）；悬停找 DeleteIcon
+- [x] 11.2 详情：上传后按 pre-upload 遗留数清理历史图
+- [x] 11.3 规格：MDL 弹窗确认按钮匹配「删除」
+
+## 12. 修复：MouseEvent 沙箱 + 详情 DeleteIcon_v2
+
+- [x] 12.1 移除 Tampermonkey 下 `MouseEvent({ view: window })` 致命错误
+- [x] 12.2 详情槽位改为 `ImageWithRemark_v2_imageContainer` + `DeleteIcon_v2`
+
+## 13. 修复：规格 ST 下拉框 + 详情清理计数
+
+- [x] 13.1 exporter：`typeLabel` 从 `#spec.parentSpecArr[n].spec_id` ST 下拉框读取
+- [x] 13.2 importer：添加规格后在新行 ST 下拉框选/填 typeLabel，再填规格值
+- [x] 13.3 详情：清理历史张数 = 上传前删除 + 上传后删除
+
+## 14. Excel 导入双次确认编辑
+
+- [x] 14.1 上传后自动点「确认编辑项」弹窗的「确认编辑」
+- [x] 14.2 再点空值提示 Popover 上的「确认编辑」
+
+## 15. SKU 空库存补 0
+
+- [x] 15.1 Excel 导入后扫描 `td.sku-input.quantity` 空值并填 0
+- [x] 15.2 虚拟表格展开后分批滚动补全

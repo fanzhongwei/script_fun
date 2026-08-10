@@ -29,3 +29,17 @@
 
 - **WHEN** 源商品有「颜色」「尺码」两个规格组
 - **THEN** manifest.specDimensions 按 DOM 顺序包含 typeLabel 为「颜色」与「尺码」的两项及各自 values
+
+### Requirement: 导出时过滤占位图与过小图
+
+拼多多轮播图、详情图采集时，脚本 SHALL 排除 DOM 文案表明为「文本暂无预览 / 暂无预览」的项，以及短边小于 480px 的图片（含已加载 img 的 natural 尺寸与背景图 URL 探测）。预览图采集不受该尺寸门槛约束（SKU 预览缩略图本身可能较小）。过滤后的列表 SHALL 用于面板展示、下载与 `manifest.json` 路径。
+
+#### Scenario: 详情区混入文本占位图
+
+- **WHEN** 详情区第 1 张为 192px「文本暂无预览」占位图，其后为合规大图
+- **THEN** 导出列表与 manifest.images.detail 不包含该占位图
+
+#### Scenario: 过小轮播图不导出
+
+- **WHEN** 某轮播图短边小于 480px
+- **THEN** 该图不出现在轮播导出列表与 manifest.images.carousel 中

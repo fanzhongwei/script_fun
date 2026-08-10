@@ -108,11 +108,11 @@ Downloads/
 
 | 类目 | DOM 范围 | 采集目标 |
 |------|----------|----------|
-| **轮播图** | `#picture` / `#basic.carousel_gallery` | `[class*="MaterialModalButton_v2_imageBox"]` 背景图（不含 `#materialPic` 白底图） |
+| **轮播图** | `#picture` / `#basic.carousel_gallery` | `MaterialModalButton_v2_imageBox` / `imgContainer` / `imageWrapper` 背景图（不含 `#materialPic` 白底图） |
 | **详情图** | `#detail_pic` | `img[data-tracking-click-viewid="el_preview_business_details"]` |
 | **预览图** | `#goods-spec-sku` / `#sku` | 按 `.sku-preview-cell` 行顺序采集，**不去重**（导出前把滚动层 `max-height/height` 撑到虚拟总高并清 spacer padding，对齐手动改法） |
 
-各类目内按 **DOM 顺序对 URL 去重**（相同链接只保留首次出现）。每个类目区块旁有 **下载全部** 按钮；导出时 **自动使用对应文件夹名**（轮播图 / 详情图 / 预览图），并同步更新顶部文件夹输入框。多类目混合下载选中时，会分别保存到各自文件夹。
+各类目内按 **DOM 顺序对 URL 去重**（相同链接只保留首次出现）。**轮播图 / 详情图**会额外过滤：DOM 文案含「文本暂无预览」的项，以及短边 &lt; 480px 的图片（含占位小图）。预览图不受该尺寸门槛约束。每个类目区块旁有 **下载全部** 按钮；导出时 **自动使用对应文件夹名**（轮播图 / 详情图 / 预览图），并同步更新顶部文件夹输入框。多类目混合下载选中时，会分别保存到各自文件夹。
 
 **预览图分桶**：当预览图总数 **超过 12 张** 时，下载路径按全局序号每 12 张一组放入区间子文件夹（如 `预览图/1-12/`、`预览图/13-24/`），文件名仍为全局连续序号（`1.jpg` … `12.jpg`、`13.jpg` …）。不超过 12 张时仍为 `预览图/1.jpg` 等扁平结构。部分选中时，序号与子文件夹区间仍按完整预览列表中的位置计算。
 
@@ -120,7 +120,7 @@ Downloads/
 
 在拼多多商家后台点击 **「一键导出」**（轮播图 + 详情图 + 预览图 + 成本表）时，脚本会在商品目录 `{商品标题-商品ID}/` 下额外写入 **`manifest.json`**，供 [商品包导入器](../pdd_product_importer/README.md) 使用。manifest 包含：
 
-- 规格维度 `specDimensions`（`typeLabel` + `values`）
+- 规格维度 `specDimensions`（`typeLabel` 取自 `.goods-spec-row` 内 ST 规格类型下拉框 + `values`）
 - 图片相对路径（轮播/详情/预览，预览含全局 `index` 与 `style`）
 - Excel 路径（默认 `成本表.xlsx`）
 
