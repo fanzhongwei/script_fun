@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.5.3
+// @version      1.6.0
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -279,6 +279,176 @@
       spacer.style.paddingBottom = '0px';
     }
     viewport.scrollTop = 0;
+  }
+
+  const MANIFEST_VERSION = '1';
+  const PIE_STYLE_HEADER_NAMES = new Set([
+    '款式', '颜色', '尺寸', '型号', '器型', '材质', '口味', '色号', '适用人群',
+    '容量', '花型', '尺码', '地点', '包装方式', '香型', '货号', '组合', '成份',
+    '版本', '度数', '运营商', '属性', '重量', '地区', '套餐', '类别', '适用年龄',
+    '功效', '品类', '时间', '规格',
+  ]);
+
+  function pieNormText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function pieIsSpecInput(input) {
+    if (!(input instanceof HTMLInputElement)) return false;
+    if (input.closest('table[class*="TB_tableWrapper"], [class*="TB_body"]')) return false;
+    const ph = input.placeholder || '';
+    if (ph === '请输入规格名称' || /^自定义/.test(ph)) return true;
+    if (/规格名称|请输入规格|规格值/.test(ph)) return true;
+    if (/库存|价格|编码|拼单价|单买价|全部颜色|全部尺寸|搜索/.test(ph)) return false;
+    return !!input.closest('.custom-input-container, .package-item-container, .package-container, .property-values-container, #newSpec, #stand_spec');
+  }
+
+  function pieQuerySpecInputs(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll('input')].filter(pieIsSpecInput);
+  }
+
+  function pieFindSpecGroupRoot(firstInput) {
+    const scope = firstInput.closest('#goods-spec-sku, #sku, #newSpec, .goods-sku-box') || document.body;
+    let el = firstInput;
+    while (el && el !== scope) {
+      const hasDelete = [...el.querySelectorAll('a, button, span')].some(
+        (node) => /删除规格类型|删除/.test((node.textContent || '').replace(/\s+/g, '')),
+      );
+      if (hasDelete && pieQuerySpecInputs(el).length > 0) return el;
+      el = el.parentElement;
+    }
+    return firstInput.closest('.package-container, .property-values-container, .custom-package') || firstInput.parentElement;
+  }
+
+  function pieGetAllSpecGroupRoots() {
+    const roots = [];
+    const seen = new Set();
+    const scopes = document.querySelectorAll('#goods-spec-sku, #sku, #newSpec, .goods-sku-box');
+    const inputs = [];
+    scopes.forEach((scope) => {
+      pieQuerySpecInputs(scope).forEach((input) => {
+        if (!inputs.includes(input)) inputs.push(input);
+      });
+    });
+    inputs.forEach((input) => {
+      const group = pieQuerySpecInputs(pieFindSpecGroupRoot(input));
+      if (!group.length || group[0] !== input) return;
+      const root = pieFindSpecGroupRoot(input);
+      if (seen.has(root)) return;
+      seen.add(root);
+      roots.push(root);
+    });
+    return roots;
+  }
+
+  function pieExtractTypeLabel(groupRoot) {
+    const nodes = groupRoot.querySelectorAll(
+      '[class*="Select"], [data-testid*="select"], [class*="title"], [class*="label"], span, div',
+    );
+    for (const node of nodes) {
+      const text = pieNormText(node.textContent);
+      if (!text || text.length > 20) continue;
+      if (/删除|添加|请输入|规格值|规格名称/.test(text)) continue;
+      if (node.closest('.custom-input-container, .package-item-container')) continue;
+      if (PIE_STYLE_HEADER_NAMES.has(text) || /^自定义/.test(text)) return text;
+    }
+    const header = groupRoot.querySelector('[class*="header"], [class*="title"]');
+    if (header) {
+      const text = pieNormText(header.textContent);
+      if (text && !/删除|添加/.test(text)) return text;
+    }
+    return '规格';
+  }
+
+  function collectSpecDimensionsForManifest() {
+    return pieGetAllSpecGroupRoots().map((root) => {
+      const inputs = pieQuerySpecInputs(root);
+      const values = inputs.map((input) => input.value.trim()).filter(Boolean);
+      return { typeLabel: pieExtractTypeLabel(root), values };
+    }).filter((dim) => dim.typeLabel || dim.values.length > 0);
+  }
+
+  function collectSkuStyleLabelsForManifest() {
+    const styles = [];
+    document.querySelectorAll('#goods-spec-sku .sku-preview-cell, #sku .sku-preview-cell').forEach((cell) => {
+      if (cell.closest(`#${ROOT_ID}`)) return;
+      const row = cell.closest('tr');
+      if (!row) {
+        styles.push('');
+        return;
+      }
+      const title = row.querySelector('.sku-row-title');
+      if (title) {
+        styles.push(pieNormText(title.textContent));
+        return;
+      }
+      const parts = [];
+      row.querySelectorAll('td').forEach((td) => {
+        const t = pieNormText(td.textContent);
+        if (t && !/预览|上传|本地上传/.test(t) && t.length < 40) parts.push(t);
+      });
+      styles.push(parts.slice(0, 3).join(' / '));
+    });
+    return styles;
+  }
+
+  function stripExportRootPath(fullPath, exportRoot) {
+    const prefix = `${exportRoot}/`;
+    if (fullPath.startsWith(prefix)) return fullPath.slice(prefix.length);
+    const idx = fullPath.indexOf('/');
+    return idx >= 0 ? fullPath.slice(idx + 1) : fullPath;
+  }
+
+  function seqFromRelativeImagePath(relPath) {
+    const m = String(relPath || '').match(/(\d+)\.\w+$/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function buildExportManifest(imageTasks, excelMissing) {
+    const exportRoot = getPddExportRootFolder() || '商品';
+    const strip = (name) => stripExportRootPath(name, exportRoot);
+    const carousel = imageTasks
+      .filter((t) => /\/轮播图\//.test(t.name))
+      .sort((a, b) => seqFromRelativeImagePath(strip(a.name)) - seqFromRelativeImagePath(strip(b.name)))
+      .map((t) => strip(t.name));
+    const detail = imageTasks
+      .filter((t) => /\/详情图\//.test(t.name))
+      .sort((a, b) => seqFromRelativeImagePath(strip(a.name)) - seqFromRelativeImagePath(strip(b.name)))
+      .map((t) => strip(t.name));
+    const styles = collectSkuStyleLabelsForManifest();
+    const preview = imageTasks
+      .filter((t) => /\/预览图\//.test(t.name))
+      .map((t) => {
+        const file = strip(t.name);
+        const index = seqFromRelativeImagePath(file);
+        return { index, file, style: styles[index - 1] || '' };
+      })
+      .sort((a, b) => a.index - b.index);
+    const meta = getPddGoodsMeta();
+    return {
+      version: MANIFEST_VERSION,
+      source: {
+        goodsId: meta.goodsId,
+        goodsTitle: meta.goodsTitle,
+        exportedAt: new Date().toISOString(),
+      },
+      specDimensions: collectSpecDimensionsForManifest(),
+      images: { carousel, detail, preview },
+      excel: excelMissing ? null : '成本表.xlsx',
+      previewTotal: preview.length,
+    };
+  }
+
+  async function writeExportManifest(rootDirHandle, manifest) {
+    const exportRoot = getPddExportRootFolder() || '商品';
+    const relPath = joinDownloadPath(exportRoot, 'manifest.json');
+    const blob = new Blob([`${JSON.stringify(manifest, null, 2)}\n`], { type: 'application/json' });
+    if (rootDirHandle) {
+      await writeBlobToDir(rootDirHandle, relPath, blob);
+      return true;
+    }
+    return gmDownloadBlob(blob, relPath);
   }
 
   /** #goods-spec-sku / #sku 规格预览图：按行顺序采集，不去重 */
@@ -1175,6 +1345,16 @@
       }
     }
 
+    let manifestWritten = false;
+    if (needExcel && imageTasks.length) {
+      try {
+        const manifest = buildExportManifest(imageTasks, excelMissing);
+        manifestWritten = await writeExportManifest(rootDirHandle, manifest);
+      } catch {
+        /* manifest 写入失败不阻断导出结果 */
+      }
+    }
+
     hideDownloadProgress();
     if (triggerBtn) triggerBtn.disabled = false;
 
@@ -1185,12 +1365,14 @@
 
     if (rootDirHandle) {
       let msg = `保存完成：成功 ${totalSuccess} 项，失败 ${totalFail} 项 → 已写入所选目录/${folderHint}`;
+      if (manifestWritten) msg += '；已写入 manifest.json';
       if (excelMissing) msg += '（成本表获取失败，请手动导出）';
       showToast(msg);
       return;
     }
 
     let msg = `下载完成：成功 ${totalSuccess} 项，失败 ${totalFail} 项 → ${folderHint}`;
+    if (manifestWritten) msg += '；已下载 manifest.json';
     if (totalFail > 0) {
       msg += '（若文件名仍为乱码，请重新下载并在弹窗中选择保存目录）';
     }
