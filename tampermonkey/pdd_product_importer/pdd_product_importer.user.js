@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.2.4
+// @version      1.2.6
 // @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -306,42 +306,169 @@
     );
   }
 
+  function findCarouselGalleryScope() {
+    const gallery = document.querySelector('#basic\\.carousel_gallery, #picture');
+    if (gallery && !gallery.closest(`#${ROOT_ID}`)) return gallery;
+    return null;
+  }
+
   function findCarouselRoot() {
-    const inGallery = document.querySelector(
-      '#basic\\.carousel_gallery [class*="MaterialModalButton_v2_materialContainer"], ' +
-      '#picture [class*="MaterialModalButton_v2_materialContainer"]',
-    );
-    if (inGallery && !inGallery.closest(`#${ROOT_ID}`)) return inGallery;
-    return document.querySelector('#basic\\.carousel_gallery, #picture') || null;
+    const scope = findCarouselGalleryScope();
+    if (!scope) return null;
+    const container = scope.querySelector('[class*="MaterialModalButton_v2_materialContainer"]');
+    return container || scope;
+  }
+
+  function findCarouselDeleteInCard(card) {
+    if (!card) return null;
+    const icon = card.querySelector('[class*="DeleteIcon_v2"], [class*="DeleteIcon"]');
+    if (icon) return icon;
+    return findDeleteButton(card);
+  }
+
+  function hasCarouselDeleteIcon(card) {
+    return !!findCarouselDeleteInCard(card);
   }
 
   function getCarouselImageBoxes() {
     const root = findCarouselRoot();
     if (!root) return [];
-    const primary = [...root.querySelectorAll(
+    const candidates = [...root.querySelectorAll(
       '[class*="MaterialModalButton_v2_imageBox"], [class*="MaterialModalButton_v2_imageWrapper"]',
-    )];
-    if (primary.length) return primary;
+    )].filter((el) => !el.closest(`#${ROOT_ID}`));
+
+    const filled = candidates.filter(hasCarouselDeleteIcon);
+    if (filled.length) return filled;
 
     const seen = new Set();
     const fallback = [];
     root.querySelectorAll('[class*="DeleteIcon"], [data-tracking-click-viewid*="delete"]').forEach((icon) => {
       const card = icon.closest('[class*="MaterialModalButton"]') || icon.parentElement;
-      if (!card || seen.has(card)) return;
+      if (!card || seen.has(card) || card.closest(`#${ROOT_ID}`)) return;
       seen.add(card);
       fallback.push(card);
     });
     return fallback;
   }
 
-  async function deleteImagesExceptFirst(boxes) {
-    for (let i = boxes.length - 1; i >= 1; i -= 1) {
-      const del = findDeleteButton(boxes[i]);
-      if (del) {
-        triggerClick(del);
-        await sleep(350);
-      }
+  function findCarouselDeletableFromSecond(boxes) {
+    for (let i = 1; i < boxes.length; i += 1) {
+      if (hasCarouselDeleteIcon(boxes[i])) return boxes[i];
     }
+    return null;
+  }
+
+  function isCarouselEmptyUploadSlot(el) {
+    if (!el || el.closest(`#${ROOT_ID}`)) return false;
+    if (hasCarouselDeleteIcon(el)) return false;
+    const text = (el.textContent || '').replace(/\s+/g, '');
+    if (/本地上传|上传图片|添加/.test(text)) return true;
+    const style = el.getAttribute('style') || '';
+    if (/background-image|background:.*url/i.test(style)) return false;
+    if (el.querySelector('img[src], [class*="imgContainer"] img')) return false;
+    return true;
+  }
+
+  function findCarouselUploadTrigger() {
+    const scope = findCarouselGalleryScope();
+    if (!scope) return null;
+
+    const tracked = scope.querySelector('[data-tracking-click-viewid="carousel_img_localfile_upload"]')
+      || document.querySelector(
+        '#picture [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
+        '#basic\\.carousel_gallery [data-tracking-click-viewid="carousel_img_localfile_upload"]',
+      );
+    if (tracked && !tracked.closest(`#${ROOT_ID}`)) return tracked;
+
+    const wrappers = [...scope.querySelectorAll(
+      '[class*="MaterialModalButton_v2_imageWrapper"], [class*="MaterialModalButton_v2_imageBox"]',
+    )];
+    for (let i = wrappers.length - 1; i >= 0; i -= 1) {
+      if (isCarouselEmptyUploadSlot(wrappers[i])) return wrappers[i];
+    }
+
+    const replaceBtn = findTextClickable(scope, /本地上传|上传图片/, 32);
+    if (replaceBtn) return replaceBtn;
+
+    return findTextClickable(scope, /更换/, 12);
+  }
+
+  function collectCarouselUploadInputs() {
+    const scope = findCarouselGalleryScope();
+    const roots = [scope, findCarouselRoot(), document.querySelector('#picture'), document.querySelector('#basic\\.carousel_gallery')]
+      .filter(Boolean);
+    const seen = new Set();
+    /** @type {HTMLInputElement[]} */
+    const inputs = [];
+    roots.forEach((root) => {
+      root.querySelectorAll('input[type=file]').forEach((el) => {
+        if (el.closest(`#${ROOT_ID}`) || el.disabled || seen.has(el)) return;
+        seen.add(el);
+        inputs.push(el);
+      });
+    });
+    return inputs;
+  }
+
+  function findCarouselUploadInput() {
+    const tracked = document.querySelector(
+      '#picture [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
+      '#basic\\.carousel_gallery [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
+      '[data-tracking-click-viewid="carousel_img_localfile_upload"]',
+    );
+    const nearTracked = findFileInputNear(tracked);
+    if (nearTracked) return nearTracked;
+
+    const inputs = collectCarouselUploadInputs();
+    if (inputs.length) return inputs[0];
+
+    const modalInput = document.querySelector(
+      '[role="dialog"] input[type=file], [class*="Modal"] input[type=file], [class*="modal"] input[type=file]',
+    );
+    if (modalInput && !modalInput.closest(`#${ROOT_ID}`) && !modalInput.disabled) return modalInput;
+
+    const trigger = findCarouselUploadTrigger();
+    return findFileInputNear(trigger);
+  }
+
+  async function ensureCarouselUploadInput() {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      let input = findCarouselUploadInput();
+      if (input) return input;
+
+      const trigger = findCarouselUploadTrigger();
+      if (trigger) {
+        triggerClick(trigger);
+        await sleep(450);
+        input = findCarouselUploadInput();
+        if (input) return input;
+      }
+
+      await deleteCarouselImagesExceptFirst();
+      await sleep(350);
+    }
+    return waitFor(() => findCarouselUploadInput(), 8000);
+  }
+
+  async function deleteCarouselSlotFast(card) {
+    const del = findCarouselDeleteInCard(card);
+    if (!del) return false;
+    clickDeleteIconFast(del);
+    await sleep(DETAIL_DELETE_GAP_MS);
+    return true;
+  }
+
+  async function deleteCarouselImagesExceptFirst() {
+    let deleted = 0;
+    for (let guard = 0; guard < 50; guard += 1) {
+      const boxes = getCarouselImageBoxes();
+      if (boxes.length <= 1) return deleted;
+      const target = findCarouselDeletableFromSecond(boxes);
+      if (!target) return deleted;
+      if (!(await deleteCarouselSlotFast(target))) return deleted;
+      deleted += 1;
+    }
+    return deleted;
   }
 
   function findTextClickable(root, pattern, maxLen = 24) {
@@ -362,38 +489,6 @@
       (el) => !el.closest(`#${ROOT_ID}`) && !el.disabled,
     );
     return inputs[0] || null;
-  }
-
-  function findCarouselUploadInput() {
-    const root = findCarouselRoot();
-    const tracked = document.querySelector(
-      '#picture [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
-      '#basic\\.carousel_gallery [data-tracking-click-viewid="carousel_img_localfile_upload"], ' +
-      '[data-tracking-click-viewid="carousel_img_localfile_upload"]',
-    );
-    const near = findFileInputNear(tracked);
-    if (near) return near;
-
-    const scoped = findFileInputInScope(root)
-      || findFileInputInScope(document.querySelector('#picture'))
-      || findFileInputInScope(document.querySelector('#basic\\.carousel_gallery'));
-    if (scoped) return scoped;
-
-    const textBtn = findTextClickable(root, /本地上传|上传图片/);
-    return findFileInputNear(textBtn);
-  }
-
-  async function ensureCarouselUploadInput() {
-    let input = findCarouselUploadInput();
-    if (input) return input;
-
-    const root = findCarouselRoot();
-    const textBtn = findTextClickable(root, /本地上传|上传图片/);
-    if (textBtn) {
-      triggerClick(textBtn);
-      await sleep(300);
-    }
-    return waitFor(() => findCarouselUploadInput(), 8000);
   }
 
   function findDetailRoot() {
@@ -561,7 +656,7 @@
     step.total = manifest.images.carousel.length;
     await focusPipelineSection(['#picture', '#basic.carousel_gallery']);
     onProgress('轮播图：删除旧图…');
-    await deleteImagesExceptFirst(getCarouselImageBoxes());
+    await deleteCarouselImagesExceptFirst();
     await sleep(400);
     onProgress(`轮播图：上传 0/${step.total}…`);
     const rawFiles = await loadFilesFromManifest(rootHandle, manifest.images.carousel);

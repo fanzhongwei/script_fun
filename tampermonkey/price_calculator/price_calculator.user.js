@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.4
+// @version      1.6.5
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -28,7 +28,7 @@
   const DEFAULTS = {
     freight: 0,
     returnRate: 20,
-    targetMargin: 20,
+    targetMargin: 30,
     platformFee: 0.6,
   };
 
@@ -61,7 +61,7 @@
 
   function createDefaultActivities() {
     return {
-      coupon: { amount: 0 },
+      coupon: { amount: 5 },
       timeLimit: { type: '打折', value: 85 },
     };
   }
@@ -1081,6 +1081,33 @@
     return true;
   }
 
+  function findMarketReferencePriceInput() {
+    return document.querySelector(
+      '#market_price input[data-testid="beast-core-inputNumber-htmlInput"], ' +
+      '#sku\\.market_price input.IPT_input, ' +
+      '#goods-spec-sku #market_price input[type="text"]',
+    );
+  }
+
+  /** @param {SkuRow[]} targets */
+  function fillMarketReferencePrice(targets) {
+    if (!targets || !targets.length) return false;
+    const singles = targets
+      .map((row) => row.singlePrice)
+      .filter((price) => price != null && Number.isFinite(price));
+    if (!singles.length) {
+      console.warn('[price_calculator] skip market reference price: no valid single prices');
+      return false;
+    }
+    const input = findMarketReferencePriceInput();
+    if (!input) {
+      console.warn('[price_calculator] skip market reference price: input not found');
+      return false;
+    }
+    const value = round2(Math.max(...singles) + 2);
+    return setInputValue(input, value.toFixed(2));
+  }
+
   async function fillBackByInputEvents(targets, skipped) {
     let success = 0;
     let fail = 0;
@@ -1114,6 +1141,10 @@
     }
 
     showNotice(`回填完成：成功 ${success} 行，跳过 ${skipped} 行，失败 ${fail} 行`);
+    if (success > 0) {
+      fillMarketReferencePrice(targets);
+    }
+    return { success, fail };
   }
 
   async function fillBackAll() {
@@ -1144,6 +1175,7 @@
       showNotice(`回填中：写入 tableList（${targets.length} 行）…`);
       const bulk = fillBackViaTableList(targets);
       if (bulk && bulk.success > 0) {
+        fillMarketReferencePrice(targets);
         showNotice(`回填中：已写入 ${bulk.success} 行，正在保存草稿…`);
         await sleep(80);
         const saved = clickSaveDraftButton();
@@ -2021,6 +2053,7 @@
       singleRandomOffset: 4,
     };
     const acts = createDefaultActivities();
+    acts.coupon.amount = 0;
     const r = calcRow(row, acts);
     console.assert(r.actualGroupPrice === 7.13, `expected actualGroup 7.13 got ${r.actualGroupPrice}`);
     console.assert(r.groupPrice === 7.13, `expected group 7.13 got ${r.groupPrice}`);
