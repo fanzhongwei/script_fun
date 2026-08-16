@@ -3,3 +3,14 @@
 .ailog/
 .cursorindexingignore
 .vscode/
+
+# watermark_remover 中间产物与打包输出
+python/watermark_remover/test_data/
+python/watermark_remover/.gui_cache/
+python/watermark_remover/__pycache__/
+python/watermark_remover/**/__pycache__/
+python/watermark_remover/dist/
+python/watermark_remover/build/
+python/watermark_remover/models/
+python/watermark_remover/*.egg-info/
+python/watermark_remover/.rocm-install.log

@@ -1,0 +1,18 @@
+# 测试与中间产物
+test_data/
+.gui_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# 打包与编译
+dist/
+build/
+*.spec.bak
+
+# 模型权重（体积大，构建时下载）
+models/
