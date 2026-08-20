@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.2.6
+// @version      1.3.0
 // @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -1144,20 +1144,20 @@
     return dims.reduce((acc, dim) => acc * Math.max(1, (dim.values || []).length), 1);
   }
 
-  function readCurrentSkuCount() {
-    ensureSkuTableHeight();
+  async function readCurrentSkuCount() {
     const hint = getSkuCountHint();
     if (hint > 0) return hint;
     return document.querySelectorAll('#sku .sku-preview-cell, #goods-spec-sku .sku-preview-cell').length;
   }
 
   async function waitForStableSkuCount(expected, timeoutMs = SPEC_SKU_VERIFY_TIMEOUT_MS) {
+    await ensureSkuTableHeight();
     const deadline = Date.now() + timeoutMs;
     let last = -1;
     let stableHits = 0;
     while (Date.now() < deadline) {
       await sleep(SPEC_SKU_POLL_MS);
-      const count = readCurrentSkuCount();
+      const count = await readCurrentSkuCount();
       if (count === expected) {
         stableHits = count === last ? stableHits + 1 : 0;
         if (stableHits >= 1) return count;
@@ -1166,7 +1166,7 @@
       }
       last = count;
     }
-    return readCurrentSkuCount();
+    return await readCurrentSkuCount();
   }
 
   async function fillAllSpecDimensions(manifest, onProgress) {
@@ -1229,7 +1229,7 @@
           steps: [...dimensionSteps, verifyStep],
           aborted: true,
           reason: fillResult.reason,
-          skuCount: readCurrentSkuCount(),
+          skuCount: await readCurrentSkuCount(),
           expectedSkuCount: expected,
         };
       }
@@ -1878,7 +1878,6 @@
   }
 
   async function scanSkuRowsWithScroll(scanFn) {
-    ensureSkuTableHeight();
     await sleep(300);
     const seen = new Set();
     const viewport = getSkuScrollViewport();
@@ -1907,7 +1906,6 @@
   }
 
   async function collectEmptyStockRowIndexes() {
-    ensureSkuTableHeight();
     await sleep(500);
     const indexes = new Set();
 
@@ -1939,7 +1937,6 @@
   }
 
   async function disableEmptyStockSkuRows() {
-    ensureSkuTableHeight();
     await sleep(500);
 
     const targetIndexes = await collectEmptyStockRowIndexes();
@@ -2034,6 +2031,25 @@
     return table ? table.parentElement : null;
   }
 
+  function clearSkuSpacer(viewport) {
+    const spacer = getSkuSpacer(viewport);
+    if (!spacer) return;
+    spacer.style.paddingTop = '0px';
+    spacer.style.paddingBottom = '0px';
+  }
+
+  function measureVirtualContentHeight(viewport) {
+    const spacer = getSkuSpacer(viewport);
+    const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
+    const rows = table.querySelectorAll(PDD_SKU_ROW_IN_TABLE);
+    let rowsH = 0;
+    rows.forEach((row) => { rowsH += row.getBoundingClientRect().height || 0; });
+    if (rowsH < 1 && rows.length > 0) rowsH = rows.length * 69;
+    const pt = spacer ? (parseFloat(spacer.style.paddingTop) || 0) : 0;
+    const pb = spacer ? (parseFloat(spacer.style.paddingBottom) || 0) : 0;
+    return Math.max(pt + rowsH + pb, viewport.scrollHeight, table.scrollHeight || 0, rowsH);
+  }
+
   function findSkuBatchInstance() {
     return findSkuTableListOwner();
   }
@@ -2050,33 +2066,86 @@
     return viewport.querySelectorAll(PDD_SKU_ROW_IN_TABLE).length;
   }
 
-  function isSkuTableHeightCorrect(viewport, count) {
-    if (!viewport || count < 1) return false;
-    const expected = count * SKU_ROW_HEIGHT_PX;
-    const mounted = viewport.querySelectorAll(PDD_SKU_ROW_IN_TABLE).length;
-    const h = parseFloat(viewport.style.height) || parseFloat(viewport.style.maxHeight) || 0;
-    const spacer = getSkuSpacer(viewport);
-    const pt = spacer ? parseFloat(spacer.style.paddingTop) || 0 : 0;
-    const pb = spacer ? parseFloat(spacer.style.paddingBottom) || 0 : 0;
-    return mounted >= count && h >= expected - 4 && pt === 0 && pb === 0;
-  }
-
-  function ensureSkuTableHeight() {
+  /**
+   * 与 image_exporter.expandPddSkuTable 对齐：滚动唤醒 + 测量定高 + DOM 稳定后再返回
+   */
+  async function expandSkuTable() {
     const viewport = getSkuScrollViewport();
     if (!viewport) return false;
-    const count = getSkuCountHint() || (document.querySelectorAll('#sku .sku-preview-cell, #goods-spec-sku .sku-preview-cell').length);
-    if (count < 1) return false;
-    if (isSkuTableHeightCorrect(viewport, count)) return true;
-    const finalH = Math.ceil(Math.max(count * SKU_ROW_HEIGHT_PX, 820) + 40);
+
+    viewport.style.maxHeight = '820px';
+    viewport.style.height = '820px';
+    viewport.style.overflowY = 'scroll';
+
+    let maxH = 0;
+    let lastScrollH = 0;
+    let stable = 0;
+    for (let i = 0; i < 120; i += 1) {
+      viewport.scrollTop = viewport.scrollHeight;
+      await sleep(40);
+      maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+      const scrollH = viewport.scrollHeight;
+      if (viewport.scrollTop + viewport.clientHeight >= scrollH - 4 && scrollH === lastScrollH) {
+        stable += 1;
+        if (stable >= 5) break;
+      } else {
+        stable = 0;
+      }
+      lastScrollH = scrollH;
+      if (i % 10 === 9) viewport.scrollTop = 0;
+    }
+
+    let finalH = Math.ceil(Math.max(maxH, 820) + 40);
     viewport.style.maxHeight = `${finalH}px`;
     viewport.style.height = `${finalH}px`;
     viewport.style.overflowY = 'scroll';
-    const spacer = getSkuSpacer(viewport);
-    if (spacer) {
-      spacer.style.paddingTop = '0px';
-      spacer.style.paddingBottom = '0px';
+    clearSkuSpacer(viewport);
+
+    viewport.scrollTop = 0;
+    await sleep(120);
+    viewport.scrollTop = viewport.scrollHeight;
+    await sleep(80);
+    maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+    if (maxH + 40 > finalH) {
+      finalH = Math.ceil(maxH + 40);
+      viewport.style.maxHeight = `${finalH}px`;
+      viewport.style.height = `${finalH}px`;
     }
+    clearSkuSpacer(viewport);
+    viewport.scrollTop = 0;
+
+    const expected = getSkuCountHint();
+    await settleSkuDomAfterExpand(viewport, expected);
     return true;
+  }
+
+  /** 高度改完后只等 DOM 行数稳定；不再按 scrollHeight 抬高（避免与容器高度正反馈产生底部空白） */
+  async function settleSkuDomAfterExpand(viewport, expectedCount = 0) {
+    if (!viewport) return;
+    let lastCount = -1;
+    let stableHits = 0;
+    for (let i = 0; i < 100; i += 1) {
+      await sleep(50);
+      clearSkuSpacer(viewport);
+      const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
+      const count = table.querySelectorAll(PDD_SKU_ROW_IN_TABLE).length;
+      const countOk = expectedCount > 0 ? count >= expectedCount : count > 0;
+      if (countOk && count === lastCount) {
+        stableHits += 1;
+        if (stableHits >= 12) break;
+      } else {
+        stableHits = 0;
+      }
+      lastCount = count;
+    }
+    clearSkuSpacer(viewport);
+    viewport.scrollTop = 0;
+    await sleep(150);
+  }
+
+  /** @deprecated 兼容旧调用名：改为异步展开对齐导出器 */
+  async function ensureSkuTableHeight() {
+    return expandSkuTable();
   }
 
   function getPreviewCells() {
@@ -2168,7 +2237,6 @@
     }
 
     await focusPipelineSection(['#goods-spec-sku', '#sku']);
-    ensureSkuTableHeight();
     await sleep(200);
 
     const chunks = chunkPreviewEntries(entries);
@@ -2180,7 +2248,6 @@
       const startRow = ci * CHUNK_SIZE;
       onProgress(`预览图：第 ${ci + 1}/${chunks.length} 批…`);
 
-      ensureSkuTableHeight();
       const allCells = getPreviewCells();
       const batchCells = allCells.slice(startRow, startRow + chunk.length);
       if (!batchCells.length) {

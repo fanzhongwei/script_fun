@@ -110,7 +110,7 @@ Downloads/
 |------|----------|----------|
 | **轮播图** | `#picture` / `#basic.carousel_gallery` | `MaterialModalButton_v2_imageBox` / `imgContainer` / `imageWrapper` 背景图（不含 `#materialPic` 白底图） |
 | **详情图** | `#detail_pic` | `img[data-tracking-click-viewid="el_preview_business_details"]` |
-| **预览图** | `#goods-spec-sku` / `#sku` | 按 `.sku-preview-cell` 行顺序采集，**不去重**（导出前把滚动层 `max-height/height` 撑到虚拟总高并清 spacer padding，对齐手动改法） |
+| **预览图** | `#goods-spec-sku` / `#sku` | 按 `.sku-preview-cell` 行顺序采集，**不去重**（**打开导出面板采集前**把滚动层撑到测量虚拟总高并清 spacer，**等待 DOM 稳定后再采集**；空闲页不监听、不反复改高度） |
 
 各类目内按 **DOM 顺序对 URL 去重**（相同链接只保留首次出现）。**轮播图 / 详情图**会额外过滤：DOM 文案含「文本暂无预览」的项，以及短边 &lt; 480px 的图片（含占位小图）。预览图不受该尺寸门槛约束。每个类目区块旁有 **下载全部** 按钮；导出时 **自动使用对应文件夹名**（轮播图 / 详情图 / 预览图），并同步更新顶部文件夹输入框。多类目混合下载选中时，会分别保存到各自文件夹。
 

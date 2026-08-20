@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         价格计算器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.5
+// @version      1.6.9
 // @description  拼多多商家后台 SKU 拼单价/单买价计算器，支持活动叠加、投产比与 Markdown 导入导出
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -48,8 +48,6 @@
   let globalActivities = createDefaultActivities();
 
   let suppressCostInput = false;
-  /** SKU 行高（px），用于虚拟表展开高度：count × 行高 */
-  const SKU_ROW_HEIGHT_PX = 70;
   /** 事件回填兜底：每批行数与让出间隔 */
   const FILL_BATCH_SIZE = 1;
   const FILL_YIELD_MS = 80;
@@ -122,56 +120,30 @@
     spacer.style.paddingBottom = '0px';
   }
 
-  /** 虚拟总高度 = paddingTop + 行高 + paddingBottom（滚动测量用） */
+  /** 虚拟总高度 = paddingTop + 行高 + paddingBottom（滚动测量用；与 image_exporter 一致） */
   function measureVirtualContentHeight(viewport) {
     const spacer = getSkuSpacer(viewport);
     const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
     const trs = table.querySelectorAll(SKU_ROW_IN_TABLE);
     let rowsH = 0;
     trs.forEach((row) => { rowsH += row.getBoundingClientRect().height || 0; });
-    if (rowsH < 1 && trs.length > 0) rowsH = trs.length * SKU_ROW_HEIGHT_PX;
+    if (rowsH < 1 && trs.length > 0) rowsH = trs.length * 69;
 
     const pt = spacer ? (parseFloat(spacer.style.paddingTop) || 0) : 0;
     const pb = spacer ? (parseFloat(spacer.style.paddingBottom) || 0) : 0;
     return Math.max(pt + rowsH + pb, viewport.scrollHeight, table.scrollHeight || 0, rowsH);
   }
 
-  /** 优先 React tableList 长度，其次已扫描 rows / 当前 DOM 行数 */
-  function getSkuCountHint() {
-    try {
-      const inst = findSkuBatchInstance();
-      if (inst?.props?.sku?.tableList?.length) return inst.props.sku.tableList.length;
-    } catch {
-      /* ignore */
-    }
-    if (rows.length > 0) return rows.length;
-    const viewport = getSkuScrollViewport();
-    if (!viewport) return 0;
-    return viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
-  }
-
   /**
-   * 展开虚拟 SKU 表（初始化/刷新用）：
-   * 1) 先在 820px 高度下反复滚到底，唤醒虚拟列表并测量
-   * 2) 再把高度设为 tableList 数量×70（无数量时用测量值），并清 spacer
-   * 注意：只改高度不清滚动挂载，会出现「只有几行 + 大片空白」
+   * 展开虚拟 SKU 表（与 image_exporter.expandPddSkuTable 对齐）：
+   * 1) 先在 820px 高度下反复滚到底，唤醒虚拟列表并测量 maxH
+   * 2) 高度设为 max(maxH, 820)+40，清 spacer；再滚一次校正
+   * 3) 等待 DOM 行数/内容高度稳定（及可选 tableList 目标行数）后再返回，避免扫描遗漏
    */
   async function loadAllVirtualSkuRows() {
     const viewport = getSkuScrollViewport();
     if (!viewport) return;
 
-    const countHint = getSkuCountHint();
-    if (viewport.dataset.pcSkuExpanded === '1') {
-      const mounted = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
-      if (countHint > 0 && mounted >= countHint) return;
-      if (countHint < 1 && mounted > 0
-        && viewport.clientHeight >= measureVirtualContentHeight(viewport) - 4) {
-        return;
-      }
-    }
-    delete viewport.dataset.pcSkuExpanded;
-
-    // 阶段1：保持可滚动，滚到底唤醒虚拟列表
     viewport.style.maxHeight = '820px';
     viewport.style.height = '820px';
     viewport.style.overflowY = 'scroll';
@@ -194,15 +166,7 @@
       if (i % 10 === 9) viewport.scrollTop = 0;
     }
 
-    // 阶段2：有 tableList/扫描数量时用 N×70；否则用滚动测量值
-    const count = getSkuCountHint();
-    const mounted = viewport.querySelectorAll(SKU_ROW_IN_TABLE).length;
-    const n = count > 0 ? count : Math.max(mounted, 1);
-    const byCount = n * SKU_ROW_HEIGHT_PX;
-    let finalH = count > 0
-      ? Math.ceil(Math.max(byCount, 820) + 40)
-      : Math.ceil(Math.max(maxH, byCount, 820) + 40);
-
+    let finalH = Math.ceil(Math.max(maxH, 820) + 40);
     viewport.style.maxHeight = `${finalH}px`;
     viewport.style.height = `${finalH}px`;
     viewport.style.overflowY = 'scroll';
@@ -212,21 +176,46 @@
     await sleep(120);
     viewport.scrollTop = viewport.scrollHeight;
     await sleep(80);
-    clearSkuSpacer(viewport);
-
-    if (count < 1) {
-      maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
-      if (maxH + 40 > finalH) {
-        finalH = Math.ceil(maxH + 40);
-        viewport.style.maxHeight = `${finalH}px`;
-        viewport.style.height = `${finalH}px`;
-      }
-      clearSkuSpacer(viewport);
+    maxH = Math.max(maxH, measureVirtualContentHeight(viewport));
+    if (maxH + 40 > finalH) {
+      finalH = Math.ceil(maxH + 40);
+      viewport.style.maxHeight = `${finalH}px`;
+      viewport.style.height = `${finalH}px`;
     }
-
-    viewport.scrollTop = 0;
     clearSkuSpacer(viewport);
-    viewport.dataset.pcSkuExpanded = '1';
+    viewport.scrollTop = 0;
+
+    let expected = 0;
+    try {
+      expected = findSkuBatchInstance()?.props?.sku?.tableList?.length || 0;
+    } catch {
+      /* ignore */
+    }
+    await settleSkuDomAfterExpand(viewport, expected);
+  }
+
+  /** 高度改完后只等 DOM 行数稳定；不再按 scrollHeight 抬高（否则会与容器高度正反馈，底部大片空白） */
+  async function settleSkuDomAfterExpand(viewport, expectedCount = 0) {
+    if (!viewport) return;
+    let lastCount = -1;
+    let stableHits = 0;
+    for (let i = 0; i < 100; i += 1) {
+      await sleep(50);
+      clearSkuSpacer(viewport);
+      const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
+      const count = table.querySelectorAll(SKU_ROW_IN_TABLE).length;
+      const countOk = expectedCount > 0 ? count >= expectedCount : count > 0;
+      if (countOk && count === lastCount) {
+        stableHits += 1;
+        if (stableHits >= 12) break;
+      } else {
+        stableHits = 0;
+      }
+      lastCount = count;
+    }
+    clearSkuSpacer(viewport);
+    viewport.scrollTop = 0;
+    await sleep(150);
   }
 
   /** 回填写入 tableList 后点击页脚「保存草稿」，让后台提交模型中的新价格 */
@@ -340,37 +329,20 @@
     return { success, fail, count: list.length };
   }
 
-  let skuExpandTimer = null;
   let skuExpandRunning = false;
 
-  function scheduleSkuTableExpand() {
-    if (skuExpandTimer) clearTimeout(skuExpandTimer);
-    skuExpandTimer = setTimeout(async () => {
-      if (skuExpandRunning) return;
-      const viewport = getSkuScrollViewport();
-      if (!viewport) return;
-      skuExpandRunning = true;
-      try {
-        await loadAllVirtualSkuRows();
-      } finally {
-        skuExpandRunning = false;
-      }
-    }, 400);
-  }
-
-  /** 页面加载完成后自动展开虚拟 SKU 表格 */
-  function initSkuTableExpandOnLoad() {
-    const run = () => scheduleSkuTableExpand();
-    run();
-    [1000, 2500, 5000, 10000].forEach((ms) => setTimeout(run, ms));
-    if (document.readyState !== 'complete') {
-      window.addEventListener('load', run, { once: true });
+  /** 打开弹窗 / 刷新时按需展开一轮；不挂常驻 MutationObserver，避免 820↔超高反馈环 */
+  async function expandSkuTableOnDemand() {
+    if (skuExpandRunning) {
+      while (skuExpandRunning) await sleep(50);
+      return;
     }
-
-    const observer = new MutationObserver(() => {
-      if (getSkuScrollViewport() && !skuExpandRunning) scheduleSkuTableExpand();
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    skuExpandRunning = true;
+    try {
+      await loadAllVirtualSkuRows();
+    } finally {
+      skuExpandRunning = false;
+    }
   }
 
   function round2(n) {
@@ -1841,10 +1813,10 @@
 
     const loading = document.createElement('div');
     loading.className = 'pc-overlay';
-    loading.innerHTML = '<div class="pc-panel" style="padding:24px;text-align:center;color:#374151">正在加载 SKU 列表...</div>';
+    loading.innerHTML = '<div class="pc-panel" style="padding:24px;text-align:center;color:#374151">正在展开 SKU 表格并等待加载完成...</div>';
     root.appendChild(loading);
 
-    await loadAllVirtualSkuRows();
+    await expandSkuTableOnDemand();
 
     root.innerHTML = '';
 
@@ -2070,6 +2042,5 @@
   }
 
   selfTestFormulas();
-  initSkuTableExpandOnLoad();
   createFab();
 })();

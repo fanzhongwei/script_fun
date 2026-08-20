@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.3
+// @version      1.6.6
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -229,7 +229,7 @@
     return Math.max(pt + rowsH + pb, viewport.scrollHeight, table.scrollHeight || 0, rowsH);
   }
 
-  /** 导出前：对齐手动改法，把滚动层 max-height/height 设为虚拟总高 */
+  /** 导出前：对齐手动改法，把滚动层 max-height/height 设为虚拟总高，并等待 DOM 稳定后再返回 */
   async function expandPddSkuTable() {
     const viewport = getPddSkuScrollViewport();
     if (!viewport) return;
@@ -256,7 +256,7 @@
       if (i % 10 === 9) viewport.scrollTop = 0;
     }
 
-    const finalH = Math.ceil(Math.max(maxH, 820) + 40);
+    let finalH = Math.ceil(Math.max(maxH, 820) + 40);
     viewport.style.maxHeight = `${finalH}px`;
     viewport.style.height = `${finalH}px`;
     viewport.style.overflowY = 'scroll';
@@ -273,15 +273,47 @@
     await sleep(80);
     maxH = Math.max(maxH, measurePddVirtualContentHeight(viewport));
     if (maxH + 40 > finalH) {
-      const bigger = Math.ceil(maxH + 40);
-      viewport.style.maxHeight = `${bigger}px`;
-      viewport.style.height = `${bigger}px`;
+      finalH = Math.ceil(maxH + 40);
+      viewport.style.maxHeight = `${finalH}px`;
+      viewport.style.height = `${finalH}px`;
     }
     if (spacer) {
       spacer.style.paddingTop = '0px';
       spacer.style.paddingBottom = '0px';
     }
     viewport.scrollTop = 0;
+    await settlePddSkuDomAfterExpand(viewport);
+  }
+
+  /** 高度改完后只等 DOM 行数稳定；不再按 scrollHeight 抬高（避免与容器高度正反馈产生底部空白） */
+  async function settlePddSkuDomAfterExpand(viewport) {
+    if (!viewport) return;
+    let lastCount = -1;
+    let stableHits = 0;
+    for (let i = 0; i < 100; i += 1) {
+      await sleep(50);
+      const spacer = getPddSkuSpacer(viewport);
+      if (spacer) {
+        spacer.style.paddingTop = '0px';
+        spacer.style.paddingBottom = '0px';
+      }
+      const table = viewport.querySelector('table[class*="TB_tableWrapper"]') || viewport;
+      const count = table.querySelectorAll(PDD_SKU_ROW_IN_TABLE).length;
+      if (count > 0 && count === lastCount) {
+        stableHits += 1;
+        if (stableHits >= 12) break;
+      } else {
+        stableHits = 0;
+      }
+      lastCount = count;
+    }
+    const spacer = getPddSkuSpacer(viewport);
+    if (spacer) {
+      spacer.style.paddingTop = '0px';
+      spacer.style.paddingBottom = '0px';
+    }
+    viewport.scrollTop = 0;
+    await sleep(150);
   }
 
   const MANIFEST_VERSION = '1';
@@ -2238,7 +2270,7 @@
     if (isPddMmsPage()) {
       root.innerHTML = [
         `<div class="pie-overlay"><div class="pie-panel">`,
-        `<div class="pie-status" style="padding:24px">正在加载 SKU 表格…</div>`,
+        `<div class="pie-status" style="padding:24px">正在展开 SKU 表格并等待加载完成…</div>`,
         `</div></div>`,
       ].join('');
       await expandPddSkuTable();
