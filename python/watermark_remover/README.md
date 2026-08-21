@@ -7,29 +7,33 @@
 ## 环境依赖说明
 
 - **操作系统**：Linux / macOS / Windows
-- **Python**：3.9+（推荐使用本机隔离环境 `python3-dev` / `pip3-dev`）
-- **硬件**：本机 CPU 即可，无需 GPU
+- **Python**：独立安装于 `/home/develop/python`（命令入口 `python3-dev` / `pip3-dev`，勿用系统 `/usr/bin/python3`）
+- **硬件**：CPU 可跑；有 NVIDIA / AMD 时自动装对应加速版 PyTorch
 - **首次运行**：LaMa 模型会自动下载（约 200MB），EasyOCR 模型首次也会下载
 - **LaMa 引擎**：使用 `simple-lama-inpainting`（比 lama-cleaner 依赖更轻）
 
-### 安装步骤
+### 安装步骤（推荐）
 
-`pip3-dev` / `python3-dev` 已默认使用清华大学 PyPI 镜像（配置见 `/home/develop/python/pip.conf`），国内下载更快。
+开发机直接启动 GUI 即可：脚本会检测环境，缺失时按 GPU 类型安装依赖，装完再启动。
 
 ```bash
-# 1. 激活开发环境（若已配置 /home/develop/python）
-source /home/develop/python/venvs/python-dev/bin/activate
-# 或直接使用 python3-dev / pip3-dev
-
-# 2. 安装 PyTorch CPU 版（镜像已含 pytorch-wheels/cpu，直接安装即可）
-pip3-dev install torch torchvision
-
-# 3. 安装其余依赖
 cd python/watermark_remover
-pip3-dev install -r requirements.txt
+./run-gui.sh
 ```
 
-若需临时改用官方源：
+行为概要：
+
+1. 若无 `python3-dev`：自动 bootstrap 独立 CPython 3.12 → `/home/develop/python`
+2. 若缺依赖：检测 GPU（NVIDIA→CUDA / AMD→ROCm / 其他→CPU）安装 torch，再装 `requirements.txt`（含 PySide6）
+3. 依赖就绪后启动界面
+
+也可只准备环境、不启动：
+
+```bash
+./packaging/linux/ensure-dev-env.sh
+```
+
+`pip3-dev` 默认走清华 PyPI（`/home/develop/python/pip.conf`）。临时改用官方源：
 
 ```bash
 PIP_CONFIG_FILE= pip3-dev install <package>
@@ -142,6 +146,19 @@ keyword_patterns:
 
 输入支持：`.png`、`.jpg`、`.jpeg`、`.webp`
 
+### 如何确认用的是独立 Python 而不是系统 python3？
+
+```bash
+which python3-dev   # 应为 /home/develop/python/bin/python3-dev
+python3-dev -c "import sys; print(sys.executable)"
+```
+
+可执行文件应落在 `/home/develop/python/venvs/python-dev/` 下。
+
+### run-gui.sh 会重复安装依赖吗？
+
+不会。已能导入 torch / PySide6 / easyocr 等模块时会跳过安装，直接启动。
+
 ## 桌面 GUI
 
 PySide6 图形界面：选图后**自动后台批量处理**，缩略图预览，手动矩形框选（不依赖 OCR 关键词），导出时使用**原图全分辨率**修复。
@@ -150,9 +167,10 @@ PySide6 图形界面：选图后**自动后台批量处理**，缩略图预览�
 
 ```bash
 cd python/watermark_remover
-pip3-dev install -r requirements.txt
-
-python3-dev -m gui
+./run-gui.sh
+# 等价：ensure-dev-env.sh 准备环境后
+# python3-dev -m gui
+# 或 python3-dev gui_entry.py
 ```
 
 ### GUI 操作流程
@@ -175,8 +193,9 @@ python/watermark_remover/
 ├── image_utils.py         # 缩略图与 mask 映射
 ├── resources.py           # 打包资源路径
 ├── patterns.yaml          # 关键词与 ROI 配置
+├── run-gui.sh             # 检测环境 / 按 GPU 装依赖 / 启动 GUI
 ├── gui/                   # 桌面 GUI（python3-dev -m gui）
-├── packaging/             # 打包脚本
+├── packaging/linux/       # bootstrap-python / ensure-dev-env / ROCm
 ├── requirements.txt
 └── README.md
 ```

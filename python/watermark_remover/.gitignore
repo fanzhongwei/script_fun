@@ -16,3 +16,4 @@ build/
 
 # 模型权重（体积大，构建时下载）
 models/
+easyocr/

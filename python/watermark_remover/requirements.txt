@@ -6,6 +6,5 @@ numpy>=1.24.0,<3.0.0
 simple-lama-inpainting>=0.1.0,<0.2.0
 PySide6>=6.6.0,<7.0.0
 
-# GUI 可选，仅 CLI 可不装 PySide6
-# PyTorch CPU 版（pip3-dev 默认走清华镜像，含 pytorch-wheels/cpu）
-# pip3-dev install torch torchvision
+# GUI 含 PySide6；PyTorch 由 ensure-dev-env.sh / run-gui.sh 按 GPU 安装：
+#   NVIDIA → cu124；AMD → ROCm（setup-rocm.sh）；其他 → CPU
