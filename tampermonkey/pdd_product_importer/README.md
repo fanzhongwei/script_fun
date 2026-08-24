@@ -52,12 +52,12 @@ Tampermonkey 用户脚本：在拼多多商家后台商品编辑页，从 [页�
 | 详情图 | 保留第 1 张占位避免空态 → 上传 manifest 全部 → **再删保留的首张旧图** |
 | 规格 | 删全部旧规格 → 按 manifest 顺序添加规格类型并填值；**校验 SKU 数量与导出一致**（不符则自动重试，最多 5 次）；类型名不匹配或 SKU 仍不一致则中断 |
 | Excel | 打开「Excel 批量编辑规格」导入 → 两次「确认编辑」 |
-| SKU启用 | Excel 导入后，**库存为空** 的 SKU 行在右侧启用列设为 **不启用**（点 Switch / 下拉选项） |
+| SKU库存 | Excel 导入后，**库存为空** 的 SKU 行将库存补为 **0**（写 React `tableList.quantity` / 库存输入框） |
 | 预览图 | 每 12 张一批上传（沿用规格核对前已展开的表格，不再重复定高） |
 
 ### 5. 汇总弹窗
 
-导入结束展示分步骤结果（含 **规格SKU数量**），可 **复制报告**。规格类型匹配失败或 SKU 数量校验失败时，Excel / SKU启用 / 预览图步骤标记为跳过。
+导入结束展示分步骤结果（含 **规格SKU数量**），可 **复制报告**。规格类型匹配失败或 SKU 数量校验失败时，Excel / SKU库存 / 预览图步骤标记为跳过。
 
 ### 6. 目录结构
 
@@ -92,7 +92,7 @@ manifest 中 `typeLabel` 须与目标页规格类型 **ST 下拉框** 显示值 
 
 ### Q5：Excel 导入后空库存怎么处理？
 
-Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库存行，再在 `#goods-spec-sku` 内定位 `td.sku-input.quantity` 与右侧 **启用** 列 Switch 设为 **不启用**；Switch 无效时回写 `is_onsale=0`。
+Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库存行，再将对应 SKU 的库存补为 **0**（批量写 `quantity`/`init_quantity`，必要时回填 `#goods-spec-sku` 内库存输入框）。不再操作右侧「启用」列。
 
 ### Q6：Excel 导入后需要保存草稿吗？
 
@@ -124,7 +124,7 @@ Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库�
 - 详情删除：`ImageWithRemark_v2_imageContainer` 内 `DeleteIcon_v2`（右上角叉）
 - 规格添加：点「添加规格类型(1/2)」→ 新行 ST 下拉框（`#spec.parentSpecArr[n].spec_id`）选/填 typeLabel → 再批量填规格值
 - Excel 导入：`button[data-tracking-viewid="confirm_edit"]`（BatchEditSkuModal 页脚）→ Popover `PP_popoverWithConfirm` 内再次确认
-- SKU 启用：`.skuModule` 内 `tableList.quantity` 判空 → 批量写 `is_onsale=0` + 点 `[class*="SW_"]` Switch（React onChange / 坐标点击）
+- SKU 库存：`.skuModule` 内 `tableList.quantity` 判空 → 批量写 `quantity=0` + 必要时 `commitSpecInput` 填库存输入框为 `0`
 - 规格类型：添加规格后列表项文本全等匹配
 
 若平台改版导致失败，请反馈页面截图与汇总报告。

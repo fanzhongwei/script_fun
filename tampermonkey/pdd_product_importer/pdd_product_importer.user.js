@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.3.0
+// @version      1.3.1
 // @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -1585,119 +1585,51 @@
     return true;
   }
 
-  function isRowDisabled(row) {
-    const statusCell = findRowEnableStatusCell(row);
-    if (!statusCell) return false;
-    return readRowEnableStatus(statusCell) === 'disabled' || !isRowEnableSwitchOn(statusCell);
+  function isQuantityEmptyValue(val) {
+    if (val == null) return true;
+    return String(val).trim() === '';
   }
 
-  function clickElementAtCenter(el) {
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 1 || rect.height < 1) return false;
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((type) => {
-      el.dispatchEvent(createMouseEvent(type, { clientX: x, clientY: y, bubbles: true }));
-    });
+  function applyEmptyQuantityToItem(item) {
+    if (!item) return false;
+    const qty = Object.prototype.hasOwnProperty.call(item, 'quantity')
+      ? item.quantity
+      : item.init_quantity;
+    if (!isQuantityEmptyValue(qty)) return false;
+    item.quantity = 0;
+    if (Object.prototype.hasOwnProperty.call(item, 'init_quantity')) item.init_quantity = 0;
+    item.forceUpdate = true;
     return true;
   }
 
-  function tryInvokeReactSwitchOff(el) {
-    let fiber = findReactFiber(el);
-    for (let i = 0; i < 60 && fiber; i += 1, fiber = fiber.return) {
-      const props = fiber.memoizedProps || fiber.pendingProps || {};
-      if (typeof props.onChange === 'function') {
-        for (const val of [false, 0, '0']) {
-          try {
-            props.onChange(val);
-            return true;
-          } catch {
-            /* ignore */
-          }
-        }
-        try {
-          props.onChange({ target: { checked: false, value: false } });
-          return true;
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    return false;
-  }
-
-  function findRowEnableSwitch(cell) {
-    if (!cell) return null;
-    const selectors = [
-      '[class*="SW_outerWrapper"]',
-      '[class*="SW_switch"]',
-      '[class*="Switch"]',
-      '[role="switch"]',
-      'input[type="checkbox"]',
-      'label',
-    ];
-    for (const sel of selectors) {
-      const el = cell.querySelector(sel);
-      if (el) return el;
-    }
-    const divs = cell.querySelectorAll('div');
-    return divs.length ? divs[divs.length - 1] : cell;
-  }
-
-  async function clickRowEnableSwitchOff(statusCell) {
-    if (!statusCell) return false;
-    const switchEl = findRowEnableSwitch(statusCell);
-    const targets = [switchEl, statusCell].filter(Boolean);
-    for (const target of targets) {
-      if (tryInvokeReactSwitchOff(target)) return true;
-      if (tryInvokeReactOnClick(target)) return true;
-      clickElementAtCenter(target);
-      triggerClick(target);
-    }
-    return false;
-  }
-
-  function disableAllEmptyStockViaReact() {
+  function fillEmptyStockViaReact() {
     const inst = findSkuTableListOwner();
     if (!inst?.props?.sku?.tableList) return 0;
     const list = JSON.parse(JSON.stringify(inst.props.sku.tableList));
     let changed = 0;
     list.forEach((item) => {
-      const qty = Object.prototype.hasOwnProperty.call(item, 'quantity')
-        ? item.quantity
-        : item.init_quantity;
-      if (!isQuantityEmptyValue(qty)) return;
-      if (item.is_onsale === 0 || item.is_onsale === false) return;
-      item.is_onsale = 0;
-      if (Object.prototype.hasOwnProperty.call(item, 'sale_status')) item.sale_status = 0;
-      item.forceUpdate = true;
-      changed += 1;
+      if (applyEmptyQuantityToItem(item)) changed += 1;
     });
     if (!changed) return 0;
     applySkuTableListUpdate(inst, list);
     return changed;
   }
 
-  function disableSkuRowViaReactByIndex(idx) {
+  function fillEmptyStockViaReactByIndex(idx) {
     const inst = findSkuTableListOwner();
     if (!inst?.props?.sku?.tableList) return false;
     if (idx < 0) return false;
     const list = JSON.parse(JSON.stringify(inst.props.sku.tableList));
     if (idx >= list.length) return false;
-    if (list[idx].is_onsale === 0 || list[idx].is_onsale === false) return true;
-    list[idx].is_onsale = 0;
-    if (Object.prototype.hasOwnProperty.call(list[idx], 'sale_status')) {
-      list[idx].sale_status = 0;
+    if (!applyEmptyQuantityToItem(list[idx])) {
+      return !isQuantityEmptyValue(
+        Object.prototype.hasOwnProperty.call(list[idx], 'quantity')
+          ? list[idx].quantity
+          : list[idx].init_quantity,
+      );
     }
-    list[idx].forceUpdate = true;
     applySkuTableListUpdate(inst, list);
-    return list[idx].is_onsale === 0;
-  }
-
-  function isQuantityEmptyValue(val) {
-    if (val == null) return true;
-    return String(val).trim() === '';
+    return true;
   }
 
   function getRowQuantityCell(row) {
@@ -1783,53 +1715,17 @@
     return indexes;
   }
 
-  function findRowEnableStatusCell(row) {
-    const sticky = row.querySelector(
-      'td[class*="rightSticky"], td[class*="rightmostTd"]',
-    );
-    if (sticky) return sticky;
-    const tds = row.querySelectorAll('td[data-testid="beast-core-table-td"]');
-    return tds.length ? tds[tds.length - 1] : null;
-  }
-
-  function readRowEnableStatus(cell) {
-    if (!cell) return '';
-    const text = (cell.textContent || '').replace(/\s+/g, '');
-    if (/不启用|未启用/.test(text)) return 'disabled';
-    if (/已启用|已上架/.test(text)) return 'enabled';
-    return '';
-  }
-
-  function isRowEnableSwitchOn(cell) {
-    if (!cell) return false;
-    const sw = findRowEnableSwitch(cell);
-    if (sw) {
-      if (sw.getAttribute('aria-checked') === 'true') return true;
-      if (/checked|active|open/i.test(sw.className || '')) return true;
-      if (sw instanceof HTMLInputElement && sw.checked) return true;
+  function getQuantityInputFromCell(cell) {
+    if (!cell) return null;
+    const inputs = cell.querySelectorAll('input');
+    for (const input of inputs) {
+      if (!(input instanceof HTMLInputElement)) continue;
+      const ph = (input.placeholder || '').replace(/\s+/g, '');
+      if (/增|减/.test(ph)) continue;
+      return input;
     }
-    return readRowEnableStatus(cell) === 'enabled';
-  }
-
-  function findDisableEnableOption() {
-    const scopes = document.querySelectorAll(
-      '[data-testid="beast-core-portal-main"], [class*="ST_dropdown"], [class*="dropdown"], [role="listbox"]',
-    );
-    for (const scope of scopes) {
-      if (scope.closest(`#${ROOT_ID}`)) continue;
-      const nodes = scope.querySelectorAll(
-        '[class*="ST_option"], [role="option"], li, [class*="Menu_item"], span, div',
-      );
-      for (const node of nodes) {
-        const text = (node.textContent || '').replace(/\s+/g, '');
-        if (text === '不启用') return node.closest('[class*="ST_option"], [role="option"], li') || node;
-      }
-    }
-    return null;
-  }
-
-  function disableSkuRowViaReact(row) {
-    return disableSkuRowViaReactByIndex(getDomRowIndex(row));
+    const input = cell.querySelector('[class*="IPT"] input, input[type="text"], input[type="number"]');
+    return input instanceof HTMLInputElement ? input : null;
   }
 
   async function scrollSkuRowIntoView(rowIndex) {
@@ -1839,9 +1735,8 @@
     await sleep(120);
   }
 
-  async function setRowDisabledWhenStockEmpty(row) {
-    if (!isRowStockEmpty(row)) return false;
-    if (isRowDisabled(row)) return true;
+  async function setRowQuantityZeroWhenEmpty(row) {
+    if (!isRowStockEmpty(row)) return true;
 
     try {
       row.scrollIntoView({ block: 'center', behavior: 'auto' });
@@ -1850,31 +1745,16 @@
     }
     await sleep(100);
 
-    const statusCell = findRowEnableStatusCell(row);
-    if (statusCell && isRowEnableSwitchOn(statusCell)) {
-      await clickRowEnableSwitchOff(statusCell);
-      await sleep(260);
+    const cell = getRowQuantityCell(row);
+    const input = getQuantityInputFromCell(cell);
+    if (input) {
+      await commitSpecInput(input, '0');
+      await sleep(120);
     }
-    if (statusCell && isRowEnableSwitchOn(statusCell)) {
-      triggerClick(statusCell);
-      await sleep(220);
-      const option = findDisableEnableOption();
-      if (option) {
-        triggerClick(option);
-        await sleep(180);
-      }
-    }
-    if (isRowDisabled(row)) return true;
 
-    disableSkuRowViaReact(row);
-    await sleep(350);
-    if (isRowDisabled(row)) return true;
-
-    if (statusCell && isRowEnableSwitchOn(statusCell)) {
-      await clickRowEnableSwitchOff(statusCell);
-      await sleep(260);
-    }
-    return isRowDisabled(row);
+    fillEmptyStockViaReactByIndex(getDomRowIndex(row));
+    await sleep(250);
+    return !isRowStockEmpty(row);
   }
 
   async function scanSkuRowsWithScroll(scanFn) {
@@ -1936,13 +1816,13 @@
     return indexes.length;
   }
 
-  async function disableEmptyStockSkuRows() {
+  async function fillEmptyStockSkuRows() {
     await sleep(500);
 
     const targetIndexes = await collectEmptyStockRowIndexes();
     if (!targetIndexes.length) return 0;
 
-    disableAllEmptyStockViaReact();
+    fillEmptyStockViaReact();
     await sleep(700);
 
     let done = 0;
@@ -1956,19 +1836,21 @@
         rows = getSkuTableRows();
         row = rows[idx];
       }
-      if (!row) continue;
-      if (!isRowStockEmpty(row)) continue;
-      if (isRowDisabled(row)) {
+      if (!row) {
+        if (fillEmptyStockViaReactByIndex(idx)) done += 1;
+        continue;
+      }
+      if (!isRowStockEmpty(row)) {
         done += 1;
         continue;
       }
-      if (await setRowDisabledWhenStockEmpty(row) && isRowDisabled(row)) done += 1;
+      if (await setRowQuantityZeroWhenEmpty(row)) done += 1;
     }
     return done;
   }
 
   async function stepSkuStock(onProgress) {
-    const step = createStepResult('sku-stock', 'SKU启用');
+    const step = createStepResult('sku-stock', 'SKU库存');
     await focusPipelineSection(['#goods-spec-sku', '#sku']);
     onProgress('SKU：等待表格数据…');
     await sleep(1200);
@@ -1977,7 +1859,7 @@
       15000,
       200,
     );
-    onProgress('SKU：空库存设为不启用…');
+    onProgress('SKU：空库存补为 0…');
 
     const emptyTotal = await countEmptyStockSkuRows();
     if (!emptyTotal) {
@@ -1991,13 +1873,13 @@
     }
     step.total = emptyTotal;
 
-    const done = await disableEmptyStockSkuRows();
+    const done = await fillEmptyStockSkuRows();
     step.ok = done;
     step.fail = Math.max(0, step.total - done);
     return finalizeStep(
       step,
       done >= step.total ? 'success' : done > 0 ? 'partial' : 'failed',
-      `空库存设为不启用：${done}/${step.total} 行`,
+      `空库存补为 0：${done}/${step.total} 行`,
     );
   }
 
@@ -2423,7 +2305,7 @@
         aborted = true;
         const specSkipReason = specResult.reason || '规格步骤失败';
         steps.push(skippedStep('excel', 'Excel导入', specSkipReason));
-        steps.push(skippedStep('sku-stock', 'SKU启用', specSkipReason));
+        steps.push(skippedStep('sku-stock', 'SKU库存', specSkipReason));
         steps.push(skippedStep('preview', '预览图', specSkipReason));
         renderSummaryModal(steps, sourceTitle, Date.now() - start, aborted);
         return;
