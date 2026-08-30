@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.10
+// @version      1.6.11
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -33,6 +33,7 @@
   let panelFolderInput = null;
   /** @type {(() => void) | null} */
   let panelSyncPresets = null;
+  let pddPanelRefreshGen = 0;
   /** @type {FileSystemDirectoryHandle | null} 本次面板会话内用户选择的保存根目录 */
   let saveDirHandle = null;
   /** @type {Map<string, FileSystemDirectoryHandle>} 写入目录缓存，避免重复 resolve */
@@ -1015,7 +1016,8 @@
     return dedupeUrlsOrdered(urls);
   }
 
-  async function discoverImagesPdd() {
+  async function discoverImagesPdd(options = {}) {
+    const { probe = true } = options;
     const collectors = {
       'category:carousel': collectCarouselImages,
       'category:detail': collectDetailImages,
@@ -1027,10 +1029,12 @@
       const collect = collectors[key];
       if (!collect) continue;
       let urls = collect();
-      if (key === 'category:detail') {
-        urls = await preferStrippedDetailUrls(urls);
-      } else if (key === 'category:carousel') {
-        urls = await filterUrlsByMinEdge(urls);
+      if (probe) {
+        if (key === 'category:detail') {
+          urls = await preferStrippedDetailUrls(urls);
+        } else if (key === 'category:carousel') {
+          urls = await filterUrlsByMinEdge(urls);
+        }
       }
       urls.forEach((url) => {
         entries.push({
@@ -1044,6 +1048,30 @@
       });
     }
     return entries;
+  }
+
+  async function discoverImagesPddFull() {
+    await expandPddSkuTable();
+    return discoverImagesPdd({ probe: true });
+  }
+
+  async function refreshPddPanelImagesInBackground(statusEl, titleEl, gridEl, folderInput) {
+    const gen = ++pddPanelRefreshGen;
+    if (statusEl) statusEl.textContent = '正在加载预览图并校验轮播/详情图…';
+    try {
+      const next = await discoverImagesPddFull();
+      if (gen !== pddPanelRefreshGen || !panelFolderInput) return;
+      if (next.length) images = next;
+      pddExportRoot = resolvePddExportRoot();
+      if (titleEl) titleEl.textContent = `发现 ${images.length} 张图片`;
+      if (gridEl && panelFolderInput) renderGrid(gridEl, folderInput);
+    } catch {
+      if (gen === pddPanelRefreshGen && statusEl) statusEl.textContent = '预览图加载失败，可关闭后重试';
+    } finally {
+      if (gen === pddPanelRefreshGen && statusEl && statusEl.textContent.startsWith('正在加载')) {
+        statusEl.textContent = '';
+      }
+    }
   }
 
   function defaultFolderName() {
@@ -1187,9 +1215,9 @@
     return entries;
   }
 
-  async function discoverImages() {
+  async function discoverImages(options = {}) {
     if (isPddMmsPage()) {
-      const pdd = await discoverImagesPdd();
+      const pdd = await discoverImagesPdd(options);
       if (pdd.length > 0) return pdd;
     }
     return discoverImagesGeneric();
@@ -1777,6 +1805,18 @@
       if (clean.changed && !clean.settled) {
         showToast('SKU 列表等待超时，仍继续导出');
         await sleep(600);
+      }
+      showToast('正在刷新图片列表…');
+      const refreshed = await discoverImagesPdd({ probe: true });
+      if (refreshed.length) {
+        images = refreshed;
+        pddExportRoot = resolvePddExportRoot();
+      } else {
+        const full = await discoverImagesPddFull();
+        if (full.length) {
+          images = full;
+          pddExportRoot = resolvePddExportRoot();
+        }
       }
     }
 
@@ -2634,19 +2674,15 @@
   async function openPanel() {
     const root = ensureRoot();
     root.innerHTML = '';
+    pddPanelRefreshGen += 1;
 
     if (isPddMmsPage()) {
-      root.innerHTML = [
-        `<div class="pie-overlay"><div class="pie-panel">`,
-        `<div class="pie-status" style="padding:24px">正在展开 SKU 表格并等待加载完成…</div>`,
-        `</div></div>`,
-      ].join('');
-      await expandPddSkuTable();
-      root.innerHTML = '';
+      images = await discoverImages({ probe: false });
+      pddExportRoot = resolvePddExportRoot();
+    } else {
+      images = await discoverImages();
+      pddExportRoot = null;
     }
-
-    images = await discoverImages();
-    pddExportRoot = isPddMmsPage() ? resolvePddExportRoot() : null;
 
     const overlay = document.createElement('div');
     overlay.className = 'pie-overlay';
@@ -2737,6 +2773,7 @@
     closeBtn.textContent = '关闭';
     closeBtn.addEventListener('click', () => {
       hideDownloadProgress();
+      pddPanelRefreshGen += 1;
       root.innerHTML = '';
       panelFolderInput = null;
       panelSyncPresets = null;
@@ -2796,6 +2833,10 @@
     panel.appendChild(grid);
     overlay.appendChild(panel);
     root.appendChild(overlay);
+
+    if (isPddMmsPage()) {
+      refreshPddPanelImagesInBackground(status, title, grid, folderInput);
+    }
   }
 
   function applyFabPosition(fab) {
