@@ -5,11 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
-import numpy as np
 
-from detector import WatermarkDetector, load_patterns, mask_from_rect
+from detector import WatermarkDetector, load_patterns
 from export_profile import ExportProfileKind, save_export_image
-from image_utils import load_image_bgr, make_thumbnail, scale_mask_to_original
+from image_utils import load_image_bgr, make_thumbnail, mask_from_regions, scale_mask_to_original
 from inpainter import InpaintEngine, Inpainter
 from resources import configure_model_environment
 
@@ -65,22 +64,18 @@ class ProcessingPipeline:
             parts.append(f"OCR={detection.matched_text}")
         task.detection_info = " · ".join(parts) or "自动检测"
 
-    def rerun_auto(self, task: ImageTask) -> None:
-        task.manual_rect = None
-        self.process_auto(task)
-
-    def process_manual(self, task: ImageTask, rect: tuple[int, int, int, int]) -> None:
+    def process_manual(self, task: ImageTask) -> None:
         if task.thumb_bgr is None:
             self.load_task(task)
         assert task.thumb_bgr is not None
+        if not task.regions:
+            raise ValueError("请先框选至少一个区域")
 
-        task.manual_rect = rect
-        task.thumb_mask = mask_from_rect(task.thumb_bgr, rect)
+        task.thumb_mask = mask_from_regions(task.thumb_bgr, task.regions)
         task.mask_source = MaskSource.MANUAL
         task.preview_bgr = self.inpainter.inpaint(task.thumb_bgr, task.thumb_mask)
         task.status = TaskStatus.MANUAL_PENDING
-        x, y, w, h = rect
-        task.detection_info = f"手动选区 ({x},{y}) {w}×{h}px"
+        task.detection_info = f"手动选区 {len(task.regions)} 块"
 
     def confirm_manual(self, task: ImageTask) -> None:
         if task.status == TaskStatus.MANUAL_PENDING:

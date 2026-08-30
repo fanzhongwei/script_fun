@@ -44,11 +44,12 @@ class BatchWorker(QThread):
 
             try:
                 self._pipeline.load_task(task, retain_original=False)
-                self._pipeline.process_auto(task)
+                task.status = TaskStatus.NEED_MASK
+                task.detection_info = "请选择形状并框选水印，然后生成预览"
             except Exception as exc:
                 task.status = TaskStatus.FAILED
                 task.error = str(exc)
-                task.detection_info = f"处理失败: {exc}"
+                task.detection_info = f"加载失败: {exc}"
 
             done += 1
             self.queue_progress.emit(done, total)
@@ -65,25 +66,18 @@ class ManualWorker(QThread):
         self,
         index: int,
         task: ImageTask,
-        rect: tuple[int, int, int, int] | None = None,
-        rerun_auto: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.index = index
         self.task = task
-        self.rect = rect
-        self.rerun_auto = rerun_auto
         self._pipeline = ProcessingPipeline()
 
     def run(self) -> None:
         try:
             if self.task.thumb_bgr is None:
                 self._pipeline.load_task(self.task, retain_original=False)
-            if self.rerun_auto:
-                self._pipeline.rerun_auto(self.task)
-            elif self.rect is not None:
-                self._pipeline.process_manual(self.task, self.rect)
+            self._pipeline.process_manual(self.task)
             self.task_updated.emit(self.index)
         except Exception as exc:
             self.task.error = str(exc)

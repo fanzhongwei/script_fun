@@ -12,11 +12,26 @@ PY_TAG="${PY_TAG:-20250317}"
 TARBALL_NAME="cpython-${PY_VERSION}+${PY_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
 TARBALL_URL="${TARBALL_URL:-https://github.com/astral-sh/python-build-standalone/releases/download/${PY_TAG}/${TARBALL_NAME}}"
 
-need_bootstrap() {
-  [ ! -x "${PY_ROOT}/bin/python3-dev" ] && return 0
-  [ ! -x "${VENV_DIR}/bin/python" ] && return 0
-  [ ! -x "${CPYTHON_DIR}/bin/python3" ] && return 0
+_python3_dev_bin() {
+  if command -v python3-dev >/dev/null 2>&1; then
+    command -v python3-dev
+    return 0
+  fi
+  if [ -x "${PY_ROOT}/bin/python3-dev" ]; then
+    echo "${PY_ROOT}/bin/python3-dev"
+    return 0
+  fi
   return 1
+}
+
+need_bootstrap() {
+  # 已有可运行的 python3-dev 即跳过，不绑定 PY_ROOT/cpython 目录布局
+  local py
+  py="$(_python3_dev_bin)" || return 0
+  if "$py" --version >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
 }
 
 write_wrappers() {
@@ -70,7 +85,7 @@ download_tarball() {
 
 bootstrap() {
   if ! need_bootstrap; then
-    echo "==> python3-dev 已就绪: $("${PY_ROOT}/bin/python3-dev" --version 2>/dev/null || true)"
+    echo "==> python3-dev 已就绪: $("$(_python3_dev_bin)" --version 2>/dev/null || true)"
     return 0
   fi
 

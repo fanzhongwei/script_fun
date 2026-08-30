@@ -23,9 +23,10 @@ cd python/watermark_remover
 
 行为概要：
 
-1. 若无 `python3-dev`：自动 bootstrap 独立 CPython 3.12 → `/home/develop/python`
-2. 若缺依赖：检测 GPU（NVIDIA→CUDA / AMD→ROCm / 其他→CPU）安装 torch，再装 `requirements.txt`（含 PySide6）
-3. 依赖就绪后启动界面
+1. 若 PATH 上已有可运行的 `python3-dev`（`--version` 成功）：**跳过**独立 CPython 安装，不因缺少 `cpython/` 目录而重装
+2. 若无 `python3-dev`：自动 bootstrap 独立 CPython → `/home/develop/python`
+3. 若缺依赖：检测 GPU（NVIDIA→CUDA / AMD→ROCm / 其他→CPU）安装 torch，再装 `requirements.txt`（含 PySide6）
+4. 依赖就绪后启动界面
 
 也可只准备环境、不启动：
 
@@ -155,13 +156,14 @@ python3-dev -c "import sys; print(sys.executable)"
 
 可执行文件应落在 `/home/develop/python/venvs/python-dev/` 下。
 
-### run-gui.sh 会重复安装依赖吗？
+### run-gui.sh 会重复安装 Python 或依赖吗？
 
-不会。已能导入 torch / PySide6 / easyocr 等模块时会跳过安装，直接启动。
+- **Python**：本机已有可运行的 `python3-dev` 时不会下载/重建解释器。
+- **依赖**：已能导入 torch / PySide6 / easyocr 等模块时会跳过 pip，直接启动。
 
 ## 桌面 GUI
 
-PySide6 图形界面：选图后**自动后台批量处理**，缩略图预览，手动矩形框选（不依赖 OCR 关键词），导出时使用**原图全分辨率**修复。
+PySide6 图形界面：选图后**只加载缩略图**（不自动 OCR/修复），用户选择形状并框选一块或多块区域，生成预览并确认后导出。导出在最长边 1024 的工作图上修复（与缩略图同级）。
 
 ### GUI 安装与启动
 
@@ -175,11 +177,21 @@ cd python/watermark_remover
 
 ### GUI 操作流程
 
-1. **选择文件** / **选择文件夹** → 自动入队处理
-2. 列表切换图片：已处理显示双栏预览；处理中显示 loading
-3. 自动失败或不满意：拖拽**矩形框选** → **生成预览**
-4. 手动框选后须点 **确认** 才可导出；自动成功的可直接导出
-5. **导出当前** / **导出全部**（跳过未就绪项并提示数量）
+1. **选择文件** / **选择文件夹** → 列表入队，后台仅加载缩略图
+2. 选择选区工具：**矩形** / **椭圆** / **多边形** / **套索**；可在同一张图上画多块（并集修复）
+3. 多边形：单击加点，双击或 Enter 闭合，Esc 取消未完成路径
+4. **生成预览** → 满意后点 **确认** 才可导出（改选区后须重新预览）
+5. **导出当前** / **导出全部**（跳过未确认项并提示数量）
+
+### 选区撤销 / 恢复
+
+| 操作 | 快捷键 | 按钮 |
+|------|--------|------|
+| 撤销 | Ctrl+Z | 撤销 |
+| 恢复 | Ctrl+Y 或 Ctrl+Shift+Z | 恢复 |
+| 清除全部选区 | — | 清除全部（可再撤销） |
+
+多边形绘制过程中 Ctrl+Z 会先回退顶点。
 
 打包见 `packaging/README.md`（Linux / Windows 全量离线包）。
 

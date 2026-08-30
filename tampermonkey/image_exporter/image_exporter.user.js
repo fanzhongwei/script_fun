@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         页面图片导出器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.6.6
+// @version      1.6.10
 // @description  拼多多商品页按轮播图/详情图/预览图分类导出，其它站点通用扫描
 // @author       script_fun
 // @match        *://*/*
@@ -459,6 +459,149 @@
     }).filter((dim) => dim.typeLabel || dim.values.length > 0);
   }
 
+  const SPEC_CLEAN_GAP_MS = 80;
+  const SPEC_AFTER_CLEAN_WAIT_MS = 400;
+  const SPEC_SKU_WAIT_TIMEOUT_MS = 20000;
+  const SPEC_SKU_WAIT_POLL_MS = 250;
+
+  function sanitizeSpecGiftText(text) {
+    let s = String(text || '');
+    s = s.replace(/赠送|赠品|附赠/g, '-');
+    s = s.replace(/[赠送]/g, '-');
+    s = s.replace(/-{2,}/g, '-');
+    return s;
+  }
+
+  function pieGetSpecValueRows() {
+    const specRows = [...document.querySelectorAll(
+      '#spec .goods-spec-row, .goods-sku-box.goods-spec .goods-spec-row',
+    )].filter((row) => !row.closest(`#${ROOT_ID}`));
+    if (specRows.length) return specRows;
+    return pieGetAllSpecGroupRoots().filter((root) => {
+      if (root.closest(`#${ROOT_ID}`)) return false;
+      return !!root.closest('#spec, .goods-sku-box.goods-spec');
+    });
+  }
+
+  function setSpecInputValue(input, value) {
+    if (!input) return false;
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (desc && desc.set) desc.set.call(input, String(value));
+    else input.value = String(value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+
+  async function commitSpecInputValue(input, value) {
+    input.focus();
+    setSpecInputValue(input, value);
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true, cancelable: true }));
+    input.blur();
+    await sleep(SPEC_CLEAN_GAP_MS);
+  }
+
+  function specRowsHaveDuplicateValues(rows) {
+    return rows.some((row) => {
+      const values = pieQuerySpecInputs(row).map((input) => pieNormText(input.value)).filter(Boolean);
+      return new Set(values).size < values.length;
+    });
+  }
+
+  function pieExpectedSkuCount() {
+    const rows = pieGetSpecValueRows();
+    if (!rows.length) return 0;
+    return rows.reduce((acc, row) => {
+      const n = pieQuerySpecInputs(row).map((input) => pieNormText(input.value)).filter(Boolean).length;
+      return acc * Math.max(n, 1);
+    }, 1);
+  }
+
+  function pieCollectCleanedSpecValues() {
+    return pieGetSpecValueRows().flatMap((row) => (
+      pieQuerySpecInputs(row).map((input) => pieNormText(input.value)).filter(Boolean)
+    ));
+  }
+
+  function collectSkuTitleTexts() {
+    const texts = [];
+    document.querySelectorAll('#sku .sku-row-title, #goods-spec-sku .sku-row-title').forEach((el) => {
+      if (el.closest(`#${ROOT_ID}`)) return;
+      const t = pieNormText(el.textContent);
+      if (t) texts.push(t);
+    });
+    if (texts.length) return texts;
+    return collectSkuStyleLabelsForManifest().filter(Boolean);
+  }
+
+  function skuTitlesStillHaveGiftWords(titles) {
+    return titles.some((t) => /赠送|赠品|附赠|[赠送]/.test(t));
+  }
+
+  function skuTitlesReflectSpecValues(titles, specValues) {
+    if (!titles.length) return false;
+    return specValues.every((v) => {
+      if (!v || v === '-') return true;
+      return titles.some((t) => t.includes(v));
+    });
+  }
+
+  /** 清洗规格后等待 SKU 表按新名字重生（行数稳定且标题不再含赠品词） */
+  async function waitForSkuTableAfterSpecClean() {
+    const expectedCount = pieExpectedSkuCount();
+    const expectedValues = pieCollectCleanedSpecValues();
+    await sleep(SPEC_AFTER_CLEAN_WAIT_MS);
+    await expandPddSkuTable();
+
+    const deadline = Date.now() + SPEC_SKU_WAIT_TIMEOUT_MS;
+    let lastSig = '';
+    let stableHits = 0;
+    while (Date.now() < deadline) {
+      const titles = collectSkuTitleTexts();
+      const rowCount = document.querySelectorAll(PDD_SKU_ROW_SELECTOR).length || titles.length;
+      const hasGift = skuTitlesStillHaveGiftWords(titles);
+      const countOk = expectedCount === 0 ? rowCount > 0 : rowCount >= expectedCount;
+      const valuesOk = skuTitlesReflectSpecValues(titles, expectedValues);
+      const ready = !hasGift && countOk && valuesOk;
+      const sig = `${rowCount}|${hasGift}|${titles.join('\u0001')}`;
+      if (ready) {
+        stableHits = sig === lastSig ? stableHits + 1 : 1;
+        lastSig = sig;
+        if (stableHits >= 4) return true;
+      } else {
+        stableHits = 0;
+        lastSig = sig;
+      }
+      await sleep(SPEC_SKU_WAIT_POLL_MS);
+    }
+    return false;
+  }
+
+  /** 一键导出前清洗规格值。已写入的清洗结果不回滚。 */
+  async function cleanSpecGiftWordsForExport() {
+    const rows = pieGetSpecValueRows();
+    let changed = 0;
+    for (const row of rows) {
+      const inputs = pieQuerySpecInputs(row);
+      for (const input of inputs) {
+        const raw = input.value;
+        const next = sanitizeSpecGiftText(raw);
+        if (next === raw) continue;
+        await commitSpecInputValue(input, next);
+        changed += 1;
+      }
+    }
+    if (specRowsHaveDuplicateValues(pieGetSpecValueRows())) {
+      return { ok: false, changed };
+    }
+    if (changed) {
+      showToast('等待 SKU 列表更新…');
+      const settled = await waitForSkuTableAfterSpecClean();
+      return { ok: true, changed, settled };
+    }
+    return { ok: true, changed, settled: true };
+  }
+
   function collectSkuStyleLabelsForManifest() {
     const styles = [];
     document.querySelectorAll('#goods-spec-sku .sku-preview-cell, #sku .sku-preview-cell').forEach((cell) => {
@@ -564,20 +707,202 @@
     return urls;
   }
 
-  /** #detail_pic 商详快捷编辑详情图 */
-  function isDetailImagePlaceholder(img) {
-    let node = img;
-    for (let i = 0; i < 8 && node; i += 1, node = node.parentElement) {
-      const text = (node.textContent || '').replace(/\s+/g, '');
-      if (PDD_PLACEHOLDER_TEXT_RE.test(text)) return true;
-    }
-    return false;
+  /** #detail_pic 商详快捷编辑详情图（含 V2 槽位） */
+  function isDetailSlotPlaceholder(slot) {
+    if (!slot) return true;
+    const text = (slot.textContent || '').replace(/\s+/g, '');
+    return PDD_PLACEHOLDER_TEXT_RE.test(text);
   }
 
-  function isHtmlImageTooSmall(img) {
-    if (!(img instanceof HTMLImageElement)) return false;
-    if (!img.complete || img.naturalWidth <= 0) return false;
-    return Math.min(img.naturalWidth, img.naturalHeight) < PDD_MIN_IMAGE_EDGE_PX;
+  /** 只要 CDN 商品图；拒绝 mms 后台相对路径被拼成假地址（如 /preview） */
+  function isLikelyDetailImageUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    if (url.startsWith('data:')) return /image\//i.test(url) && url.length > 200;
+    if (/\.svg(\?|$)/i.test(url)) return false;
+    if (!/^https?:/i.test(url) && !url.startsWith('//')) return false;
+    try {
+      const u = new URL(url, document.baseURI);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+      if (/mms\.pinduoduo\.com$/i.test(u.hostname)) return false;
+      const hay = `${u.hostname}${u.pathname}`;
+      if (/pddpic|yangkeduo\.com|pfs\.|t16img|mms-material|funimg/i.test(hay)) return true;
+      return /\.(jpe?g|png|webp|gif)(\?|$)/i.test(u.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  /** 去掉 imageView2 / imageMogr2 / OSS 缩放参数，保留其余 query */
+  function stripPddImageTransform(url) {
+    if (!url || typeof url !== 'string') return url;
+    let next = url
+      .replace(/([?&])imageView2\/[^&]*/gi, '$1')
+      .replace(/([?&])imageMogr2\/[^&]*/gi, '$1')
+      .replace(/[?&]imageView2(?=&|$)/gi, '')
+      .replace(/[?&]imageMogr2(?=&|$)/gi, '')
+      .replace(/[?&]x-oss-process=[^&]*/gi, '');
+    next = next.replace(/\?&+/g, '?').replace(/&&+/g, '&').replace(/[?&]$/, '');
+    return next || url;
+  }
+
+  function firstBackgroundUrlDeep(el) {
+    if (!el || !el.style) return null;
+    const sources = [
+      el.style.backgroundImage,
+      el.style.background,
+    ];
+    try {
+      const cs = getComputedStyle(el);
+      sources.push(cs.backgroundImage, cs.background);
+      sources.push(getComputedStyle(el, '::before').backgroundImage);
+      sources.push(getComputedStyle(el, '::after').backgroundImage);
+    } catch {
+      /* ignore */
+    }
+    for (const src of sources) {
+      const urls = parseBackgroundUrls(src);
+      const hit = urls.find((u) => isLikelyDetailImageUrl(u));
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function findImageUrlInValue(val, depth) {
+    if (depth > 4 || val == null) return null;
+    if (typeof val === 'string') {
+      if (val.length < 16 || !/https?:|pddpic|\.(jpe?g|png|webp)/i.test(val)) return null;
+      const abs = toAbsoluteUrl(val);
+      return isLikelyDetailImageUrl(abs) ? abs : null;
+    }
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const found = findImageUrlInValue(item, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (typeof val !== 'object') return null;
+    const preferKeys = ['originUrl', 'imgUrl', 'imageUrl', 'picUrl', 'fileUrl', 'thumbUrl', 'srcUrl', 'url', 'src'];
+    for (const key of preferKeys) {
+      if (!(key in val)) continue;
+      const found = findImageUrlInValue(val[key], depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function collectUrlFromFiber(el) {
+    const fiber = findReactFiber(el);
+    if (!fiber) return null;
+    const props = fiber.memoizedProps || fiber.pendingProps;
+    if (!props || typeof props !== 'object') return null;
+    if (Array.isArray(props.list) && props.list.length > 2) return null;
+    if (Array.isArray(props.images) && props.images.length > 2) return null;
+    return findImageUrlInValue(props, 0);
+  }
+
+  function getDetailUploadedLeafSlots(root) {
+    const matched = [...root.querySelectorAll('div, li')].filter((el) => {
+      if (el.closest(`#${ROOT_ID}`)) return false;
+      const text = (el.textContent || '').replace(/\s+/g, '');
+      if (!text || text.length > 48) return false;
+      if (PDD_PLACEHOLDER_TEXT_RE.test(text)) return false;
+      return /预览/.test(text) && /更换/.test(text);
+    });
+    return matched.filter((el) => !matched.some((other) => other !== el && el.contains(other)));
+  }
+
+  function getDetailImageSlots() {
+    const root = document.querySelector('#detail_pic');
+    if (!root || root.closest(`#${ROOT_ID}`)) return [];
+
+    const slots = [];
+    const seen = new Set();
+    const add = (el) => {
+      if (!el || seen.has(el) || !root.contains(el) || el.closest(`#${ROOT_ID}`)) return;
+      seen.add(el);
+      slots.push(el);
+    };
+
+    getDetailUploadedLeafSlots(root).forEach(add);
+
+    root.querySelectorAll('[class*="ImageWithRemark"][class*="imageContainer"]').forEach(add);
+
+    root.querySelectorAll(
+      '[class*="quick_decoration_v2_sortableWrapper"], [class*="sortableWrapper"]',
+    ).forEach((wrap) => {
+      [...wrap.children].forEach((child) => {
+        if (!(child instanceof HTMLElement)) return;
+        const text = (child.textContent || '').replace(/\s+/g, '');
+        const changeCount = (text.match(/更换/g) || []).length;
+        const nodes = changeCount > 1 ? [...child.children] : [child];
+        nodes.forEach((node) => {
+          if (!(node instanceof HTMLElement)) return;
+          const covered = slots.some((s) => node.contains(s) || s.contains(node) || s === node);
+          if (!covered) add(node);
+        });
+      });
+    });
+
+    root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]').forEach((img) => {
+      add(
+        img.closest('[class*="ImageWithRemark"]')
+        || img.closest('[class*="Grid_row"] > div')
+        || img.parentElement,
+      );
+    });
+
+    return slots;
+  }
+
+  function collectUrlFromDetailSlot(slot) {
+    if (!slot) return null;
+
+    const fromFiber = collectUrlFromFiber(slot);
+    const fromDom = [];
+
+    const collectFromEl = (el) => {
+      if (!el) return;
+      if (el instanceof HTMLImageElement) {
+        collectImgCandidates(el).forEach((raw) => {
+          const abs = toAbsoluteUrl(raw);
+          if (isLikelyDetailImageUrl(abs)) fromDom.push(abs);
+        });
+        return;
+      }
+      const bg = firstBackgroundUrlDeep(el);
+      if (isLikelyDetailImageUrl(bg)) fromDom.push(toAbsoluteUrl(bg));
+    };
+
+    collectFromEl(slot);
+    slot.querySelectorAll(
+      '[class*="imageBox"], [class*="imgContainer"], [class*="imageWrapper"], [class*="imageContainer"], img',
+    ).forEach(collectFromEl);
+    slot.querySelectorAll('*').forEach((el) => {
+      if (el.matches && el.matches('button, [class*="DeleteIcon"]')) return;
+      const bg = firstBackgroundUrlDeep(el);
+      if (isLikelyDetailImageUrl(bg)) fromDom.push(toAbsoluteUrl(bg));
+    });
+
+    const ranked = [];
+    const push = (url) => {
+      if (!url || ranked.includes(url)) return;
+      ranked.push(url);
+    };
+    fromDom
+      .filter(Boolean)
+      .sort((a, b) => {
+        const score = (u) => (
+          (/pddpic|mms-material|yangkeduo/i.test(u) ? 4 : 0)
+          + (/\.(jpe?g|png|webp)(\?|$)/i.test(u) ? 2 : 0)
+          + Math.min(u.length, 200) / 200
+        );
+        return score(b) - score(a);
+      })
+      .forEach(push);
+    if (!ranked.length) push(fromFiber);
+
+    return ranked[0] || null;
   }
 
   function probeImageMinEdge(url, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
@@ -610,17 +935,44 @@
     return out;
   }
 
+  async function preferStrippedDetailUrls(urls) {
+    const out = [];
+    for (const url of urls) {
+      const stripped = stripPddImageTransform(url);
+      if (stripped && stripped !== url) {
+        const ok = await probeImageMinEdge(stripped, 1);
+        out.push(ok ? stripped : url);
+      } else {
+        out.push(url);
+      }
+    }
+    return out;
+  }
+
   function collectDetailImages() {
     const root = document.querySelector('#detail_pic');
     if (!root || root.closest(`#${ROOT_ID}`)) return [];
 
     const urls = [];
     root.querySelectorAll('img[data-tracking-click-viewid="el_preview_business_details"]').forEach((img) => {
-      if (isDetailImagePlaceholder(img)) return;
-      if (isHtmlImageTooSmall(img)) return;
-      const candidate = collectImgCandidates(img).map((raw) => toAbsoluteUrl(raw)).find(Boolean);
+      if (img.closest(`#${ROOT_ID}`)) return;
+      const candidate = collectImgCandidates(img).map((raw) => toAbsoluteUrl(raw)).find((u) => {
+        if (!u) return false;
+        try {
+          return new URL(u).hostname !== 'mms.pinduoduo.com';
+        } catch {
+          return false;
+        }
+      });
       if (candidate) urls.push(candidate);
     });
+
+    getDetailImageSlots().forEach((slot) => {
+      if (isDetailSlotPlaceholder(slot)) return;
+      const candidate = collectUrlFromDetailSlot(slot);
+      if (candidate) urls.push(candidate);
+    });
+
     return dedupeUrlsOrdered(urls);
   }
 
@@ -675,7 +1027,9 @@
       const collect = collectors[key];
       if (!collect) continue;
       let urls = collect();
-      if (key === 'category:carousel' || key === 'category:detail') {
+      if (key === 'category:detail') {
+        urls = await preferStrippedDetailUrls(urls);
+      } else if (key === 'category:carousel') {
         urls = await filterUrlsByMinEdge(urls);
       }
       urls.forEach((url) => {
@@ -1411,6 +1765,20 @@
     }
 
     if (triggerBtn) triggerBtn.disabled = true;
+
+    if (needExcel) {
+      showToast('正在清洗规格名称…');
+      const clean = await cleanSpecGiftWordsForExport();
+      if (!clean.ok) {
+        if (triggerBtn) triggerBtn.disabled = false;
+        showToast('已清洗规格但因重复中断，请改重复项后重新一键导出');
+        return;
+      }
+      if (clean.changed && !clean.settled) {
+        showToast('SKU 列表等待超时，仍继续导出');
+        await sleep(600);
+      }
+    }
 
     let rootDirHandle = null;
     if (canUseFileSystemAccess()) {

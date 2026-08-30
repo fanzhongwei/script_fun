@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.3.1
-// @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图
+// @version      1.4.0
+// @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图/运费模板
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
 // @grant        GM_setValue
@@ -26,6 +26,10 @@
   const SPEC_SKU_VERIFY_TIMEOUT_MS = 18000;
   const SPEC_SKU_POLL_MS = 250;
   const PDD_MIN_IMAGE_EDGE_PX = 480;
+  const FREIGHT_TEMPLATE_NAME = '偏远地区不包邮';
+  /** 「文本暂无预览」占位图为 192×192 小 PNG */
+  const PDD_TEXT_PLACEHOLDER_EDGE_PX = 192;
+  const PDD_TEXT_PLACEHOLDER_MAX_BYTES = 8192;
   const PDD_SKU_ROW_IN_TABLE = 'tbody tr[class*="TB_tr"], tbody [data-testid="beast-core-table-body-tr"]';
 
   /** @type {boolean} */
@@ -629,12 +633,46 @@
     });
   }
 
+  function isTextNoPreviewPlaceholderFile(file) {
+    return new Promise((resolve) => {
+      if (!file || file.size > PDD_TEXT_PLACEHOLDER_MAX_BYTES) {
+        resolve(false);
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      const finish = (yes) => {
+        img.onload = null;
+        img.onerror = null;
+        URL.revokeObjectURL(url);
+        resolve(yes);
+      };
+      img.onload = () => {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+        finish(w === PDD_TEXT_PLACEHOLDER_EDGE_PX && h === PDD_TEXT_PLACEHOLDER_EDGE_PX);
+      };
+      img.onerror = () => finish(false);
+      img.src = url;
+    });
+  }
+
   async function filterFilesByMinEdge(files, minEdge = PDD_MIN_IMAGE_EDGE_PX) {
     const kept = [];
     let skipped = 0;
     for (const file of files) {
       if (await probeFileMinEdge(file, minEdge)) kept.push(file);
       else skipped += 1;
+    }
+    return { files: kept, skipped };
+  }
+
+  async function filterDetailPlaceholderFiles(files) {
+    const kept = [];
+    let skipped = 0;
+    for (const file of files) {
+      if (await isTextNoPreviewPlaceholderFile(file)) skipped += 1;
+      else kept.push(file);
     }
     return { files: kept, skipped };
   }
@@ -692,10 +730,10 @@
     await sleep(400);
     onProgress(`详情图：上传 0/${step.total}…`);
     const rawFiles = await loadFilesFromManifest(rootHandle, manifest.images.detail);
-    const { files, skipped } = await filterFilesByMinEdge(rawFiles);
+    const { files, skipped } = await filterDetailPlaceholderFiles(rawFiles);
     if (!files.length) {
       const reason = step.total
-        ? (skipped ? `有效图 0 张（跳过过小/占位 ${skipped}）` : '未读取到详情图文件')
+        ? (skipped ? `有效图 0 张（跳过「文本暂无预览」占位 ${skipped}）` : '未读取到详情图文件')
         : '已跳过';
       return finalizeStep(step, step.total ? 'failed' : 'skipped', reason);
     }
@@ -714,7 +752,7 @@
       }
       await sleep(400);
       const totalCleaned = deletedPre + deletedPost;
-      const skipHint = skipped ? `，跳过过小/占位 ${skipped}` : '';
+      const skipHint = skipped ? `，跳过「文本暂无预览」占位 ${skipped}` : '';
       const legacyHint = totalCleaned ? `，已清理历史 ${totalCleaned} 张` : '';
       return finalizeStep(step, 'success', `上传 ${files.length}/${step.total} 张${skipHint}${legacyHint}`);
     }
@@ -2180,6 +2218,425 @@
     );
   }
 
+  function findServiceExpandButton() {
+    const root = document.querySelector('#goods-service');
+    if (!root || root.closest(`#${ROOT_ID}`)) return null;
+    const tracked = root.querySelector('[data-tracking-click-viewid="el_expand_edit_button"], .bottom-switch');
+    if (tracked && /展开修改/.test(pieNormText(tracked.textContent))) return tracked;
+    return findTextClickable(root, /展开修改/, 12);
+  }
+
+  function findFreightTemplateScope() {
+    const scope = document.querySelector('#goods-service, #template, #cost_template_id');
+    if (!scope || scope.closest(`#${ROOT_ID}`)) return null;
+    return scope;
+  }
+
+  function findFreightRadioGroup() {
+    const selectors = [
+      '#cost_template_id [data-testid="beast-core-radioGroup"]',
+      '[id*="is_default_template"] [data-testid="beast-core-radioGroup"]',
+      '#goods-service [data-testid="beast-core-radioGroup"]',
+      '#cost_template_id [class*="RDG_outerWrapper"]',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && !el.closest(`#${ROOT_ID}`)) return el;
+    }
+    return null;
+  }
+
+  function findBeastRadioLabel(item) {
+    if (!item) return null;
+    if (item.matches?.('label[data-testid="beast-core-radio"]')) return item;
+    return item.closest?.('label[data-testid="beast-core-radio"]') || null;
+  }
+
+  function findOtherTemplateRadioLabel() {
+    const scopes = [
+      document.querySelector('#cost_template_id'),
+      document.querySelector('[id*="is_default_template"]'),
+      document.querySelector('#goods-service'),
+    ].filter((el) => el && !el.closest(`#${ROOT_ID}`));
+
+    for (const scope of scopes) {
+      const tracked = scope.querySelector(
+        'input[data-tracking-click-viewid="el_other_template_drop_down_boxes"]',
+      );
+      if (tracked) {
+        return findBeastRadioLabel(tracked) || tracked;
+      }
+    }
+
+    const group = findFreightRadioGroup();
+    if (!group) return null;
+
+    const labels = [...group.querySelectorAll('label[data-testid="beast-core-radio"]')].filter(
+      (el) => !el.closest(`#${ROOT_ID}`),
+    );
+    for (const label of labels) {
+      const text = (label.textContent || '').replace(/\s+/g, '');
+      if (text.includes('其他模板') && !text.includes('新疆西藏收费默认模板')) {
+        return label;
+      }
+    }
+    return labels.length >= 2 ? labels[labels.length - 1] : null;
+  }
+
+  function isBeastRadioOptionSelected(item) {
+    const label = findBeastRadioLabel(item);
+    if (label) {
+      const checked = label.getAttribute('data-checked');
+      if (checked === 'true') return true;
+      if (checked === 'false') return false;
+    }
+    if (!item) return false;
+    const input = label?.querySelector('input[type="radio"]')
+      || (item instanceof HTMLInputElement && item.type === 'radio' ? item : item.querySelector?.('input[type="radio"]'));
+    return !!(input && input.checked);
+  }
+
+  function nativeClick(el) {
+    if (!el) return false;
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'auto' });
+    } catch {
+      /* ignore */
+    }
+    if (typeof el.click === 'function') {
+      el.click();
+      return true;
+    }
+    return triggerClick(el);
+  }
+
+  function clickBeastRadioOption(option) {
+    const label = findBeastRadioLabel(option) || option;
+    if (!label) return false;
+    return nativeClick(label);
+  }
+
+  function findDefaultTemplateBlock() {
+    const scopes = [
+      document.querySelector('[id*="is_default_template"]'),
+      document.querySelector('[id*="default_template_id"]'),
+      document.querySelector('#cost_template_id'),
+      document.querySelector('#goods-service .service-extend'),
+      document.querySelector('#goods-service'),
+    ];
+    return scopes.find((el) => el && !el.closest(`#${ROOT_ID}`) && /其他模板/.test(el.textContent || '')) || null;
+  }
+
+  /** 在 scope 内找文案恰好为 phrase 的最小可点击节点 */
+  function findExactTextClickable(scope, phrase) {
+    if (!scope) return null;
+    const target = String(phrase || '').replace(/\s+/g, '');
+    let best = null;
+    let bestScore = Infinity;
+    scope.querySelectorAll('label, span, div, button, a, [role="radio"], [class*="Radio"]').forEach((node) => {
+      if (node.closest(`#${ROOT_ID}`)) return;
+      const text = (node.textContent || '').replace(/\s+/g, '');
+      if (text !== target) return;
+      const score = node.children.length * 100 + text.length;
+      if (score < bestScore) {
+        bestScore = score;
+        best = node;
+      }
+    });
+    if (best) {
+      const radio = best.querySelector('input[type="radio"]')
+        || best.closest('label')?.querySelector('input[type="radio"]');
+      return radio || best.closest('label, [role="radio"]') || best;
+    }
+    return null;
+  }
+
+  function findRadioByLabel(scope, labelText) {
+    if (!scope) return null;
+    const target = String(labelText || '').replace(/\s+/g, '');
+    const radios = [...scope.querySelectorAll('input[type="radio"]')].filter(
+      (el) => !el.closest(`#${ROOT_ID}`),
+    );
+    for (const radio of radios) {
+      let node = radio;
+      for (let i = 0; i < 6 && node && scope.contains(node); i += 1, node = node.parentElement) {
+        const text = (node.textContent || '').replace(/\s+/g, '');
+        if (text === target || (text.endsWith(target) && text.length <= target.length + 8)) {
+          return radio;
+        }
+      }
+    }
+    if (radios.length >= 2) {
+      const last = radios[radios.length - 1];
+      const lastText = (last.closest('label, [class*="Radio"], [class*="radio"]')?.textContent
+        || last.parentElement?.textContent || '').replace(/\s+/g, '');
+      if (lastText.includes(target)) return last;
+    }
+    return null;
+  }
+
+  function findOtherTemplateToggle() {
+    return findOtherTemplateRadioLabel();
+  }
+
+  function isFreightOtherTemplateMode() {
+    if (findFreightTemplateBox()) return true;
+    const option = findOtherTemplateToggle();
+    return isBeastRadioOptionSelected(option);
+  }
+
+  async function ensureFreightOtherTemplateMode(onProgress) {
+    if (findFreightTemplateBox()) return true;
+
+    const ready = await waitFor(() => findOtherTemplateRadioLabel(), 8000);
+    if (!ready) return false;
+
+    let option = findOtherTemplateRadioLabel();
+    if (!option) return false;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (isBeastRadioOptionSelected(option) || findFreightTemplateBox()) break;
+      onProgress(
+        attempt === 0
+          ? '运费模板：切换到「其他模板」…'
+          : `运费模板：重试选择「其他模板」(${attempt + 1}/4)…`,
+      );
+      clickBeastRadioOption(option);
+      const switched = await waitFor(
+        () => {
+          const label = findOtherTemplateRadioLabel();
+          if (label && isBeastRadioOptionSelected(label)) return label;
+          return findFreightTemplateBox() || null;
+        },
+        2500,
+        100,
+      );
+      if (switched) {
+        option = findOtherTemplateRadioLabel() || option;
+        break;
+      }
+      option = findOtherTemplateRadioLabel() || option;
+      await sleep(300);
+    }
+
+    if (findFreightTemplateBox()) return true;
+    if (isBeastRadioOptionSelected(option)) {
+      return !!(await waitFor(() => findFreightTemplateBox(), 6000));
+    }
+    return false;
+  }
+
+  function findFreightTemplateBox() {
+    const selectors = [
+      '#cost_template_id .template-box-select',
+      '#goods-service .template-box-select',
+      '#template .template-box-select',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && !el.closest(`#${ROOT_ID}`)) return el;
+    }
+    const scope = findFreightTemplateScope();
+    return scope?.querySelector('.template-box-select') || null;
+  }
+
+  function readFreightTemplateLabel() {
+    const box = findFreightTemplateBox();
+    if (!box) return '';
+    return pieNormText(box.textContent).replace(/新建运费模板/g, '').trim();
+  }
+
+  function isElementVisible(el) {
+    if (!el || !(el instanceof Element)) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function findFreightTemplateDropdownTrigger(box) {
+    if (!box) return null;
+    return box.querySelector(
+      '[class*="ST_outerWrapper"], [class*="ST_selectValueSingle"], [class*="ST_inputWrapper"], '
+      + '[class*="IPT_inputWrapper"], [class*="selectValue"], [class*="SelectValue"]',
+    ) || box;
+  }
+
+  function looksLikeFreightTemplateDropdownPortal(el) {
+    if (!el || el.closest(`#${ROOT_ID}`) || !isElementVisible(el)) return false;
+    const text = pieNormText(el.textContent);
+    if (!text || text.length < 8) return false;
+    return /模板|包邮|不配送/.test(text)
+      && (text.includes('偏远地区不包邮') || text.includes('内地包邮') || text.includes('新疆西藏'));
+  }
+
+  function getOpenFreightTemplateDropdownPortal() {
+    const box = findFreightTemplateBox();
+    const boxRect = box?.getBoundingClientRect();
+    const portals = [...document.querySelectorAll(
+      '[data-testid="beast-core-portal"][class*="ST_dropdown"], '
+      + '[class*="ST_dropdown"][class*="PT_outerWrapper"], [class*="ST_dropdown"]',
+    )].filter(looksLikeFreightTemplateDropdownPortal);
+
+    if (!portals.length) return null;
+    if (!boxRect) return portals[0];
+
+    portals.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return Math.abs(ar.top - boxRect.bottom) - Math.abs(br.top - boxRect.bottom)
+        || Math.abs(ar.left - boxRect.left) - Math.abs(br.left - boxRect.left);
+    });
+    return portals[0];
+  }
+
+  function isFreightTemplateDropdownOpen() {
+    return !!getOpenFreightTemplateDropdownPortal();
+  }
+
+  async function openFreightTemplateDropdown(onProgress) {
+    const box = findFreightTemplateBox();
+    if (!box) return false;
+    if (isFreightTemplateDropdownOpen()) return true;
+
+    await focusPipelineSection(['#cost_template_id', '#template', '#goods-service'], 200);
+
+    const triggers = dedupeElements([
+      findFreightTemplateDropdownTrigger(box),
+      box.querySelector('[class*="arrow"], [class*="Arrow"], [class*="suffix"], [class*="Suffix"]'),
+      box,
+    ]);
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      onProgress(
+        attempt === 0
+          ? '运费模板：点击展开下拉列表…'
+          : `运费模板：重试展开下拉列表(${attempt + 1}/4)…`,
+      );
+      for (const trigger of triggers) {
+        nativeClick(trigger);
+        const opened = await waitFor(() => getOpenFreightTemplateDropdownPortal(), 1200, 80);
+        if (opened) return true;
+      }
+      await sleep(250);
+    }
+    return isFreightTemplateDropdownOpen();
+  }
+
+  function isFreightTemplateOptionLeaf(node, want) {
+    if (!node || node.closest(`#${ROOT_ID}, #sku, [class*="TB_tableWrapper"]`)) return false;
+    const text = pieNormText(node.textContent);
+    if (text !== want) return false;
+    return ![...node.children].some((child) => pieNormText(child.textContent) === want);
+  }
+
+  function collectFreightTemplateOptionMatches(root, want) {
+    if (!root) return [];
+    const matches = [];
+    root.querySelectorAll('li, div, span, a, button, [role="option"], [class*="ST_item"], [class*="item"], [class*="option"]').forEach((node) => {
+      if (!isFreightTemplateOptionLeaf(node, want)) return;
+      if (!isElementVisible(node)) return;
+      matches.push(node);
+    });
+    matches.sort((a, b) => a.children.length - b.children.length || a.textContent.length - b.textContent.length);
+    return matches;
+  }
+
+  function findFreightTemplateOption(target) {
+    const want = pieNormText(target);
+    if (!want) return null;
+
+    const portal = getOpenFreightTemplateDropdownPortal();
+    if (!portal) return null;
+
+    const matches = collectFreightTemplateOptionMatches(portal, want);
+    return matches[0] || null;
+  }
+
+  async function revealFreightTemplateOption(target) {
+    const want = pieNormText(target);
+    let option = findFreightTemplateOption(want);
+    if (option) return option;
+
+    const portal = getOpenFreightTemplateDropdownPortal();
+    if (!portal) return null;
+
+    const scrollEl = portal.querySelector(
+      '[class*="scroll"], [class*="Scroll"], [class*="list"], [class*="List"], [class*="menu"], [class*="Menu"]',
+    ) || portal;
+    for (let i = 0; i < 24; i += 1) {
+      option = findFreightTemplateOption(want);
+      if (option) return option;
+      scrollEl.scrollTop += 140;
+      await sleep(80);
+    }
+    return findFreightTemplateOption(want);
+  }
+
+  async function stepFreightTemplate(onProgress) {
+    const step = createStepResult('freight', '运费模板');
+    step.total = 1;
+    await focusPipelineSection(['#goods-service', '#template', '#cost_template_id']);
+    onProgress('运费模板：展开服务与履约…');
+
+    const expandBtn = findServiceExpandButton();
+    if (expandBtn) {
+      triggerClick(expandBtn);
+      await sleep(600);
+    }
+
+    await waitFor(() => findDefaultTemplateBlock(), 8000);
+
+    const otherToggle = findOtherTemplateToggle();
+    if (!otherToggle) {
+      return finalizeStep(step, 'failed', '未找到「其他模板」单选（请确认已展开服务与履约）');
+    }
+
+    if (!(await ensureFreightOtherTemplateMode(onProgress))) {
+      return finalizeStep(
+        step,
+        'failed',
+        '未能切换到「其他模板」或未出现运费模板下拉框（请手动点选「其他模板」后重试）',
+      );
+    }
+
+    const box = findFreightTemplateBox();
+    if (!box) {
+      return finalizeStep(step, 'failed', '未找到运费模板下拉框');
+    }
+
+    const current = readFreightTemplateLabel();
+    if (current === FREIGHT_TEMPLATE_NAME) {
+      step.ok = 1;
+      return finalizeStep(step, 'success', `已是「${FREIGHT_TEMPLATE_NAME}」`);
+    }
+
+    onProgress('运费模板：点击展开下拉列表…');
+    if (!(await openFreightTemplateDropdown(onProgress))) {
+      return finalizeStep(step, 'failed', '未能展开运费模板下拉列表');
+    }
+
+    onProgress(`运费模板：选择「${FREIGHT_TEMPLATE_NAME}」…`);
+    const option = await revealFreightTemplateOption(FREIGHT_TEMPLATE_NAME);
+    if (!option) {
+      return finalizeStep(step, 'failed', `下拉中未找到「${FREIGHT_TEMPLATE_NAME}」`);
+    }
+    try {
+      option.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+    } catch {
+      /* ignore */
+    }
+    nativeClick(option);
+    await sleep(400);
+
+    const selected = readFreightTemplateLabel();
+    if (selected === FREIGHT_TEMPLATE_NAME || selected.includes(FREIGHT_TEMPLATE_NAME)) {
+      step.ok = 1;
+      return finalizeStep(step, 'success', `已选择「${FREIGHT_TEMPLATE_NAME}」`);
+    }
+    return finalizeStep(step, 'failed', `选择后当前为「${selected || '未知'}」`);
+  }
+
   function buildReport(steps, sourceTitle, elapsedMs, aborted) {
     const lines = [
       `商品包导入结果`,
@@ -2307,6 +2764,7 @@
         steps.push(skippedStep('excel', 'Excel导入', specSkipReason));
         steps.push(skippedStep('sku-stock', 'SKU库存', specSkipReason));
         steps.push(skippedStep('preview', '预览图', specSkipReason));
+        steps.push(skippedStep('freight', '运费模板', specSkipReason));
         renderSummaryModal(steps, sourceTitle, Date.now() - start, aborted);
         return;
       }
@@ -2314,6 +2772,7 @@
       steps.push(await stepExcel(manifest, rootHandle, onProgress));
       steps.push(await stepSkuStock(onProgress));
       steps.push(await stepPreview(manifest, rootHandle, onProgress));
+      steps.push(await stepFreightTemplate(onProgress));
     } catch (err) {
       steps.push(createStepResult('fatal', '致命错误'));
       const last = steps[steps.length - 1];

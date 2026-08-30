@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+
+class RegionKind(str, Enum):
+    RECT = "rect"
+    ELLIPSE = "ellipse"
+    POLYGON = "polygon"
+    LASSO = "lasso"
+
+
+@dataclass
+class Region:
+    kind: RegionKind
+    x: int = 0
+    y: int = 0
+    w: int = 0
+    h: int = 0
+    points: list[tuple[int, int]] = field(default_factory=list)
 
 
 def load_image_bgr(path: Path) -> np.ndarray:
@@ -57,3 +76,44 @@ def scale_mask_to_original(thumb_mask: np.ndarray, original_shape: tuple[int, in
     if thumb_mask.shape[0] == orig_h and thumb_mask.shape[1] == orig_w:
         return thumb_mask
     return cv2.resize(thumb_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+
+
+def _clip_rect(x: int, y: int, w: int, h: int, width: int, height: int) -> tuple[int, int, int, int] | None:
+    x2 = min(width, x + w)
+    y2 = min(height, y + h)
+    x = max(0, x)
+    y = max(0, y)
+    w = x2 - x
+    h = y2 - y
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def mask_from_regions(image: np.ndarray, regions: list[Region]) -> np.ndarray:
+    height, width = image.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for region in regions:
+        if region.kind in (RegionKind.RECT, RegionKind.ELLIPSE):
+            clipped = _clip_rect(region.x, region.y, region.w, region.h, width, height)
+            if clipped is None:
+                continue
+            x, y, w, h = clipped
+            if region.kind == RegionKind.RECT:
+                cv2.rectangle(mask, (x, y), (x + w, y + h), 255, thickness=-1)
+            else:
+                cx = x + w // 2
+                cy = y + h // 2
+                ax = max(1, w // 2)
+                ay = max(1, h // 2)
+                cv2.ellipse(mask, (cx, cy), (ax, ay), 0, 0, 360, 255, thickness=-1)
+            continue
+
+        if len(region.points) < 3:
+            continue
+        pts = np.array(
+            [(max(0, min(width - 1, px)), max(0, min(height - 1, py))) for px, py in region.points],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(mask, [pts], 255)
+    return mask

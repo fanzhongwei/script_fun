@@ -54,10 +54,11 @@ Tampermonkey 用户脚本：在拼多多商家后台商品编辑页，从 [页�
 | Excel | 打开「Excel 批量编辑规格」导入 → 两次「确认编辑」 |
 | SKU库存 | Excel 导入后，**库存为空** 的 SKU 行将库存补为 **0**（写 React `tableList.quantity` / 库存输入框） |
 | 预览图 | 每 12 张一批上传（沿用规格核对前已展开的表格，不再重复定高） |
+| 运费模板 | 在「服务与履约」点 **展开修改** → 选 **其他模板** → **点击** `.template-box-select` 展开下拉 → 选 **偏远地区不包邮** |
 
 ### 5. 汇总弹窗
 
-导入结束展示分步骤结果（含 **规格SKU数量**），可 **复制报告**。规格类型匹配失败或 SKU 数量校验失败时，Excel / SKU库存 / 预览图步骤标记为跳过。
+导入结束展示分步骤结果（含 **规格SKU数量**、**运费模板**），可 **复制报告**。规格类型匹配失败或 SKU 数量校验失败时，Excel / SKU库存 / 预览图 / 运费模板步骤标记为跳过。
 
 ### 6. 目录结构
 
@@ -114,7 +115,7 @@ Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库�
 
 ### Q10：详情图提示尺寸不符 / 假成功？
 
-常见原因是源商品详情混入了「文本暂无预览」占位小图（短边 &lt; 480px）。请升级 image_exporter 后**重新一键导出**；导入器也会在上传前跳过短边 &lt; 480px 的文件，并在步骤详情标明跳过数。
+详情图上传前**只跳过**「文本暂无预览」占位图（固定 192×192 小 PNG），不再按短边 480px 丢掉正常详情图。若包里仍含该占位图会被跳过并在步骤详情标明张数。轮播图仍按短边 480px 过滤。
 
 ### Q11：DOM 依赖说明（实现参考）
 
@@ -126,6 +127,7 @@ Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库�
 - Excel 导入：`button[data-tracking-viewid="confirm_edit"]`（BatchEditSkuModal 页脚）→ Popover `PP_popoverWithConfirm` 内再次确认
 - SKU 库存：`.skuModule` 内 `tableList.quantity` 判空 → 批量写 `quantity=0` + 必要时 `commitSpecInput` 填库存输入框为 `0`
 - 规格类型：添加规格后列表项文本全等匹配
+- 运费模板：`#goods-service` 展开修改 → 选「其他模板」→ 点击 `.template-box-select` 展开 `ST_dropdown` portal → 选「偏远地区不包邮」
 
 若平台改版导致失败，请反馈页面截图与汇总报告。
 
