@@ -28,6 +28,7 @@ script_fun/
 
 ### Tampermonkey 脚本
 - [image_exporter](tampermonkey/image_exporter/) — 页面图片导出器：发现 img/CSS 背景图，复选批量下载
+- [stock_checker](tampermonkey/stock_checker/) — 1688 爱用分销库存检查：规格匹配核对并导出 Excel
 - 网页增强脚本
 - 自动化操作脚本
 - 其他浏览器扩展脚本
