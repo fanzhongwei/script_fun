@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         拼多多商品包导入器
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.4.0
+// @version      1.5.1
 // @description  从 image_exporter 导出的商品包文件夹一键导入：轮播/详情/规格/Excel/预览图/运费模板
 // @author       script_fun
 // @match        *://mms.pinduoduo.com/*
@@ -31,6 +31,10 @@
   const PDD_TEXT_PLACEHOLDER_EDGE_PX = 192;
   const PDD_TEXT_PLACEHOLDER_MAX_BYTES = 8192;
   const PDD_SKU_ROW_IN_TABLE = 'tbody tr[class*="TB_tr"], tbody [data-testid="beast-core-table-body-tr"]';
+  /** Excel 导入后的库存映射：<=20 → 0，>20 → 10 */
+  const STOCK_IMPORT_LOW_MAX = 20;
+  const STOCK_IMPORT_LOW_VALUE = 0;
+  const STOCK_IMPORT_HIGH_VALUE = 10;
 
   /** @type {boolean} */
   let pipelineRunning = false;
@@ -1628,43 +1632,85 @@
     return String(val).trim() === '';
   }
 
-  function applyEmptyQuantityToItem(item) {
+  function getItemQuantity(item) {
+    if (!item) return null;
+    const candidates = [];
+    if (Object.prototype.hasOwnProperty.call(item, 'quantity')) candidates.push(item.quantity);
+    if (Object.prototype.hasOwnProperty.call(item, 'init_quantity')) candidates.push(item.init_quantity);
+    if (!candidates.length) return null;
+    let picked = candidates[0];
+    for (let i = 1; i < candidates.length; i += 1) {
+      picked = pickRawQuantity(picked, candidates[i]);
+    }
+    return picked;
+  }
+
+  function parseQuantityNumber(val) {
+    if (isQuantityEmptyValue(val)) return 0;
+    const n = Number(String(val).trim().replace(/[,，]/g, ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function mappedImportQuantity(val) {
+    return parseQuantityNumber(val) <= STOCK_IMPORT_LOW_MAX
+      ? STOCK_IMPORT_LOW_VALUE
+      : STOCK_IMPORT_HIGH_VALUE;
+  }
+
+  function quantityNeedsMap(val) {
+    if (isQuantityEmptyValue(val)) return true;
+    return parseQuantityNumber(val) !== mappedImportQuantity(val);
+  }
+
+  function pickRawQuantity(existingRaw, newRaw) {
+    if (newRaw == null) return existingRaw;
+    if (existingRaw == null) return newRaw;
+    const existingNeeds = quantityNeedsMap(existingRaw);
+    const newNeeds = quantityNeedsMap(newRaw);
+    if (newNeeds && !existingNeeds) return newRaw;
+    if (existingNeeds && !newNeeds) return existingRaw;
+    if (existingNeeds && newNeeds) {
+      return parseQuantityNumber(newRaw) > parseQuantityNumber(existingRaw) ? newRaw : existingRaw;
+    }
+    return existingRaw;
+  }
+
+  function quantityMatchesTarget(val, target) {
+    if (isQuantityEmptyValue(val)) return false;
+    return parseQuantityNumber(val) === target;
+  }
+
+  function applyExactQuantityToItem(item, qty) {
     if (!item) return false;
-    const qty = Object.prototype.hasOwnProperty.call(item, 'quantity')
-      ? item.quantity
-      : item.init_quantity;
-    if (!isQuantityEmptyValue(qty)) return false;
-    item.quantity = 0;
-    if (Object.prototype.hasOwnProperty.call(item, 'init_quantity')) item.init_quantity = 0;
+    if (quantityMatchesTarget(getItemQuantity(item), qty)) return false;
+    item.quantity = qty;
+    item.init_quantity = qty;
     item.forceUpdate = true;
     return true;
   }
 
-  function fillEmptyStockViaReact() {
+  function fillStockViaReactFromTargets(targets) {
     const inst = findSkuTableListOwner();
-    if (!inst?.props?.sku?.tableList) return 0;
+    if (!inst?.props?.sku?.tableList || !targets?.size) return 0;
     const list = JSON.parse(JSON.stringify(inst.props.sku.tableList));
     let changed = 0;
-    list.forEach((item) => {
-      if (applyEmptyQuantityToItem(item)) changed += 1;
+    targets.forEach((qty, idx) => {
+      if (idx < 0 || idx >= list.length) return;
+      if (applyExactQuantityToItem(list[idx], qty)) changed += 1;
     });
     if (!changed) return 0;
     applySkuTableListUpdate(inst, list);
     return changed;
   }
 
-  function fillEmptyStockViaReactByIndex(idx) {
+  function fillStockViaReactByIndex(idx, qty) {
     const inst = findSkuTableListOwner();
     if (!inst?.props?.sku?.tableList) return false;
     if (idx < 0) return false;
     const list = JSON.parse(JSON.stringify(inst.props.sku.tableList));
     if (idx >= list.length) return false;
-    if (!applyEmptyQuantityToItem(list[idx])) {
-      return !isQuantityEmptyValue(
-        Object.prototype.hasOwnProperty.call(list[idx], 'quantity')
-          ? list[idx].quantity
-          : list[idx].init_quantity,
-      );
+    if (!applyExactQuantityToItem(list[idx], qty)) {
+      return quantityMatchesTarget(getItemQuantity(list[idx]), qty);
     }
     applySkuTableListUpdate(inst, list);
     return true;
@@ -1711,46 +1757,31 @@
     if (!list) return null;
     const idx = getDomRowIndex(row);
     if (idx < 0 || idx >= list.length) return null;
-    const item = list[idx];
-    if (Object.prototype.hasOwnProperty.call(item, 'quantity')) return item.quantity;
-    if (Object.prototype.hasOwnProperty.call(item, 'init_quantity')) return item.init_quantity;
-    return null;
+    return getItemQuantity(list[idx]);
   }
 
-  function isRowStockEmpty(row) {
+  function readRowQuantityRaw(row) {
     const cell = getRowQuantityCell(row);
     if (cell) {
       const val = readQuantityFromCell(cell);
-      if (val === '') return true;
-      if (val !== null && val !== '') return false;
+      if (val === '') return '';
+      if (val !== null) return val;
       const text = (cell.textContent || '').replace(/\s+/g, '');
-      return text === '' || text === '请输入';
+      if (text === '请输入' || text === '') return '';
+      if (/^\d+$/.test(text)) return text;
     }
-    const reactQty = readRowQuantityFromReact(row);
-    if (reactQty != null) return isQuantityEmptyValue(reactQty);
-    return false;
+    return readRowQuantityFromReact(row);
   }
 
-  function isQuantityCellEmpty(cell) {
-    if (!cell) return false;
+  function readQuantityCellRaw(cell) {
+    if (!cell) return null;
     const val = readQuantityFromCell(cell);
-    if (val === '') return true;
-    if (val !== null && val !== '') return false;
+    if (val === '') return '';
+    if (val !== null) return val;
     const text = (cell.textContent || '').replace(/\s+/g, '');
-    return text === '' || text === '请输入';
-  }
-
-  function getEmptyStockIndexesFromReact() {
-    const list = getSkuTableList();
-    if (!list?.length) return null;
-    const indexes = [];
-    list.forEach((item, idx) => {
-      const qty = Object.prototype.hasOwnProperty.call(item, 'quantity')
-        ? item.quantity
-        : item.init_quantity;
-      if (isQuantityEmptyValue(qty)) indexes.push(idx);
-    });
-    return indexes;
+    if (text === '' || text === '请输入') return '';
+    if (/^\d+$/.test(text)) return text;
+    return null;
   }
 
   function getQuantityInputFromCell(cell) {
@@ -1773,8 +1804,8 @@
     await sleep(120);
   }
 
-  async function setRowQuantityZeroWhenEmpty(row) {
-    if (!isRowStockEmpty(row)) return true;
+  async function setRowQuantityTo(row, target) {
+    if (quantityMatchesTarget(readRowQuantityRaw(row), target)) return true;
 
     try {
       row.scrollIntoView({ block: 'center', behavior: 'auto' });
@@ -1786,13 +1817,13 @@
     const cell = getRowQuantityCell(row);
     const input = getQuantityInputFromCell(cell);
     if (input) {
-      await commitSpecInput(input, '0');
+      await commitSpecInput(input, String(target));
       await sleep(120);
     }
 
-    fillEmptyStockViaReactByIndex(getDomRowIndex(row));
+    fillStockViaReactByIndex(getDomRowIndex(row), target);
     await sleep(250);
-    return !isRowStockEmpty(row);
+    return quantityMatchesTarget(readRowQuantityRaw(row), target);
   }
 
   async function scanSkuRowsWithScroll(scanFn) {
@@ -1823,48 +1854,47 @@
     viewport.scrollTop = 0;
   }
 
-  async function collectEmptyStockRowIndexes() {
+  async function collectStockMapTargets() {
     await sleep(500);
-    const indexes = new Set();
+    const raws = new Map();
+    const remember = (idx, raw) => {
+      if (idx < 0) return;
+      raws.set(idx, pickRawQuantity(raws.get(idx), raw));
+    };
 
     await scanSkuRowsWithScroll((row) => {
-      if (!isRowStockEmpty(row)) return;
-      const idx = getDomRowIndex(row);
-      if (idx >= 0) indexes.add(idx);
+      remember(getDomRowIndex(row), readRowQuantityRaw(row));
     });
 
     getAllQuantityCells().forEach((cell) => {
-      if (!isQuantityCellEmpty(cell)) return;
       const row = cell.closest('tr');
       if (!row) return;
-      const idx = getDomRowIndex(row);
-      if (idx >= 0) indexes.add(idx);
+      remember(getDomRowIndex(row), readQuantityCellRaw(cell));
     });
 
-    const reactIndexes = getEmptyStockIndexesFromReact();
-    if (reactIndexes?.length) {
-      reactIndexes.forEach((idx) => indexes.add(idx));
+    const list = getSkuTableList();
+    if (list?.length) {
+      list.forEach((item, idx) => remember(idx, getItemQuantity(item)));
     }
 
-    return [...indexes].sort((a, b) => a - b);
+    const targets = new Map();
+    raws.forEach((raw, idx) => {
+      if (!quantityNeedsMap(raw)) return;
+      targets.set(idx, mappedImportQuantity(raw));
+    });
+    return targets;
   }
 
-  async function countEmptyStockSkuRows() {
-    const indexes = await collectEmptyStockRowIndexes();
-    return indexes.length;
-  }
+  async function fillMappedStockSkuRows(targets) {
+    if (!targets?.size) return 0;
 
-  async function fillEmptyStockSkuRows() {
-    await sleep(500);
-
-    const targetIndexes = await collectEmptyStockRowIndexes();
-    if (!targetIndexes.length) return 0;
-
-    fillEmptyStockViaReact();
+    fillStockViaReactFromTargets(targets);
     await sleep(700);
 
     let done = 0;
-    for (const idx of targetIndexes) {
+    const indexes = [...targets.keys()].sort((a, b) => a - b);
+    for (const idx of indexes) {
+      const target = targets.get(idx);
       await scrollSkuRowIntoView(idx);
       await sleep(120);
       let rows = getSkuTableRows();
@@ -1875,14 +1905,14 @@
         row = rows[idx];
       }
       if (!row) {
-        if (fillEmptyStockViaReactByIndex(idx)) done += 1;
+        if (fillStockViaReactByIndex(idx, target)) done += 1;
         continue;
       }
-      if (!isRowStockEmpty(row)) {
+      if (quantityMatchesTarget(readRowQuantityRaw(row), target)) {
         done += 1;
         continue;
       }
-      if (await setRowQuantityZeroWhenEmpty(row)) done += 1;
+      if (await setRowQuantityTo(row, target)) done += 1;
     }
     return done;
   }
@@ -1897,27 +1927,27 @@
       15000,
       200,
     );
-    onProgress('SKU：空库存补为 0…');
+    onProgress('SKU：库存映射（≤20→0，>20→10）…');
 
-    const emptyTotal = await countEmptyStockSkuRows();
-    if (!emptyTotal) {
+    const targets = await collectStockMapTargets();
+    if (!targets.size) {
       const domRows = getSkuTableRows().length;
       const qtyCells = getAllQuantityCells().length;
       return finalizeStep(
         step,
         'skipped',
-        `无空库存行（表格 ${domRows} 行，库存列 ${qtyCells} 格）`,
+        `无需映射（表格 ${domRows} 行，库存列 ${qtyCells} 格）`,
       );
     }
-    step.total = emptyTotal;
+    step.total = targets.size;
 
-    const done = await fillEmptyStockSkuRows();
+    const done = await fillMappedStockSkuRows(targets);
     step.ok = done;
     step.fail = Math.max(0, step.total - done);
     return finalizeStep(
       step,
       done >= step.total ? 'success' : done > 0 ? 'partial' : 'failed',
-      `空库存补为 0：${done}/${step.total} 行`,
+      `库存映射（≤20→0，>20→10）：${done}/${step.total} 行`,
     );
   }
 

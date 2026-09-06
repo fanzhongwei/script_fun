@@ -52,7 +52,7 @@ Tampermonkey 用户脚本：在拼多多商家后台商品编辑页，从 [页�
 | 详情图 | 保留第 1 张占位避免空态 → 上传 manifest 全部 → **再删保留的首张旧图** |
 | 规格 | 删全部旧规格 → 按 manifest 顺序添加规格类型并填值；**校验 SKU 数量与导出一致**（不符则自动重试，最多 5 次）；类型名不匹配或 SKU 仍不一致则中断 |
 | Excel | 打开「Excel 批量编辑规格」导入 → 两次「确认编辑」 |
-| SKU库存 | Excel 导入后，**库存为空** 的 SKU 行将库存补为 **0**（写 React `tableList.quantity` / 库存输入框） |
+| SKU库存 | Excel 导入后，按导入库存映射： **≤20（含空）→ 0**，**>20 → 10**（写 React `tableList.quantity` / 库存输入框） |
 | 预览图 | 每 12 张一批上传（沿用规格核对前已展开的表格，不再重复定高） |
 | 运费模板 | 在「服务与履约」点 **展开修改** → 选 **其他模板** → **点击** `.template-box-select` 展开下拉 → 选 **偏远地区不包邮** |
 
@@ -89,11 +89,16 @@ manifest 中 `typeLabel` 须与目标页规格类型 **ST 下拉框** 显示值 
 
 ### Q4：SKU 表格高度是什么？
 
-大规格商品使用虚拟表格。导入时**仅在规格 SKU 数量核对前**按与图片导出器相同的方式展开一次（滚动唤醒 → 测量定高 → 等待 DOM 稳定）；核对通过后的空库存处理、预览图上传等步骤**不再**重复展开。**空闲编辑页不会**常驻监听或反复改写 SKU 高度。
+大规格商品使用虚拟表格。导入时**仅在规格 SKU 数量核对前**按与图片导出器相同的方式展开一次（滚动唤醒 → 测量定高 → 等待 DOM 稳定）；核对通过后的库存映射、预览图上传等步骤**不再**重复展开。**空闲编辑页不会**常驻监听或反复改写 SKU 高度。
 
-### Q5：Excel 导入后空库存怎么处理？
+### Q5：Excel 导入后库存怎么处理？
 
-Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库存行，再将对应 SKU 的库存补为 **0**（批量写 `quantity`/`init_quantity`，必要时回填 `#goods-spec-sku` 内库存输入框）。不再操作右侧「启用」列。
+Excel 确认编辑后，脚本以页面库存输入框为准读取导入库存（React `tableList.quantity` 常为默认 0，不会盖掉 Excel 导入后的实际库存），再一次性映射写入：
+
+- 空库存或数值 **≤ 20** → 设为 **0**
+- 数值 **> 20** → 设为 **10**
+
+写入方式为批量更新 `quantity`/`init_quantity`，必要时回填 `#goods-spec-sku` 内库存输入框。不再操作右侧「启用」列。该步骤只按 Excel 导入后的原始库存映射一次，不会把已经写成 10 的行再次清成 0。
 
 ### Q6：Excel 导入后需要保存草稿吗？
 
@@ -125,7 +130,7 @@ Excel 确认编辑后，脚本优先读 React `tableList.quantity` 识别空库�
 - 详情删除：`ImageWithRemark_v2_imageContainer` 内 `DeleteIcon_v2`（右上角叉）
 - 规格添加：点「添加规格类型(1/2)」→ 新行 ST 下拉框（`#spec.parentSpecArr[n].spec_id`）选/填 typeLabel → 再批量填规格值
 - Excel 导入：`button[data-tracking-viewid="confirm_edit"]`（BatchEditSkuModal 页脚）→ Popover `PP_popoverWithConfirm` 内再次确认
-- SKU 库存：`.skuModule` 内 `tableList.quantity` 判空 → 批量写 `quantity=0` + 必要时 `commitSpecInput` 填库存输入框为 `0`
+- SKU 库存：`.skuModule` 内按导入库存映射（≤20→0，>20→10）→ 批量写 `quantity` + 必要时 `commitSpecInput` 回填库存输入框
 - 规格类型：添加规格后列表项文本全等匹配
 - 运费模板：`#goods-service` 展开修改 → 选「其他模板」→ 点击 `.template-box-select` 展开 `ST_dropdown` portal → 选「偏远地区不包邮」
 
