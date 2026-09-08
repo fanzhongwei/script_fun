@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         1688库存检查
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.2.9
+// @version      1.2.11
 // @description  爱用分销商品管理：核对店铺 SKU 与 1688 货源库存，导出双 Sheet Excel
 // @author       script_fun
 // @match        *://light-app.1688.com/*
@@ -66,7 +66,7 @@
     }
     if (!onSale && shopStock != null && shopStock > 0) return '关联异常';
     if (shopStock != null && sourceStock != null && shopStock > sourceStock) return '库存异常';
-    if (shopStock === 0 && sourceStock != null && sourceStock > 0) return '补充库存';
+    if (shopStock === 0 && sourceStock != null && sourceStock > LOW_STOCK_THRESHOLD) return '补充库存';
     if (shopStock != null && shopStock > 0 && sourceStock != null && sourceStock <= LOW_STOCK_THRESHOLD) return '库存告急';
     return '库存正常';
   }
