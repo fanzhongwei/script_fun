@@ -8,7 +8,7 @@
 
 - **操作系统**：Linux / macOS / Windows
 - **Python**：独立安装于 `/home/develop/python`（命令入口 `python3-dev` / `pip3-dev`，勿用系统 `/usr/bin/python3`）
-- **硬件**：CPU 可跑；有 NVIDIA / AMD 时自动装对应加速版 PyTorch
+- **硬件**：CPU 可跑；有 NVIDIA / AMD 时自动装对应加速版 PyTorch。Linux 开发环境将本机判为 NVIDIA 的依据（任一即可）：`nvidia-smi -L` 能列出 GPU、存在 `/dev/nvidia0` 或 `/dev/nvidiactl`、内核已加载 `nvidia` 模块、`lspci` 含 `nvidia` 或厂商号 `10de`。不依赖 `lspci` 必须打印单词 `nvidia`。若已误装 CPU 版 PyTorch，再次运行 `run-gui.sh` / `ensure-dev-env.sh` 会改装 CUDA 版。CUDA wheel 源按 `python3-dev` 版本自动选择（本机 3.14 不会再走没有包的 cu124）。
 - **首次运行**：LaMa 模型会自动下载（约 200MB），EasyOCR 模型首次也会下载
 - **LaMa 引擎**：使用 `simple-lama-inpainting`（比 lama-cleaner 依赖更轻）
 
@@ -25,7 +25,7 @@ cd python/watermark_remover
 
 1. 若 PATH 上已有可运行的 `python3-dev`（`--version` 成功）：**跳过**独立 CPython 安装，不因缺少 `cpython/` 目录而重装
 2. 若无 `python3-dev`：自动 bootstrap 独立 CPython → `/home/develop/python`
-3. 若缺依赖：检测 GPU（NVIDIA→CUDA / AMD→ROCm / 其他→CPU）安装 torch，再装 `requirements.txt`（含 PySide6）
+3. 若缺依赖，或本机为 NVIDIA 但当前 torch 不含 CUDA：按 **当前 python3-dev 版本** 选择有对应 wheel 的 CUDA 源（如 3.10–3.12→cu124，3.14→cu126/cu128/cu130），再装 `requirements.txt`。可用 `TORCH_CUDA_INDEX` 覆盖。判为 CPU 时日志会打印未命中的 NVIDIA 信号。
 4. 依赖就绪后启动界面
 
 也可只准备环境、不启动：
@@ -160,6 +160,16 @@ python3-dev -c "import sys; print(sys.executable)"
 
 - **Python**：本机已有可运行的 `python3-dev` 时不会下载/重建解释器。
 - **依赖**：已能导入 torch / PySide6 / easyocr 等模块时会跳过 pip，直接启动。
+
+### 安装时报 NumPy / meson / 找不到 g++？
+
+Python 3.14 没有 NumPy 1.26 的预编译包。`simple-lama-inpainting` 又要求 `numpy<2`，pip 会去源码编译，没有 `g++` 时就会报 `Unknown compiler(s)`。开发环境脚本在 3.13+ 会改装 NumPy 2.x 的 wheel，并对 lama 使用 `--no-deps`。可额外安装编译器（其它源码包可能用到）：
+
+```bash
+sudo apt-get install -y g++ build-essential
+```
+
+然后重新执行 `./packaging/linux/ensure-dev-env.sh`。
 
 ## 桌面 GUI
 
