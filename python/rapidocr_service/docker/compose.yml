@@ -1,0 +1,71 @@
+name: rapidocr-service
+
+services:
+  cpu:
+    profiles: ["cpu"]
+    image: rapidocr-service:cpu
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    ports:
+      - "9003:9003"
+    environment:
+      TZ: Asia/Shanghai
+      OCR_WORKERS: ${OCR_WORKERS:-4}
+    command:
+      [
+        "sh",
+        "-c",
+        "exec rapidocr_api -ip 0.0.0.0 -p 9003 -workers $${OCR_WORKERS}",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  gpu:
+    profiles: ["gpu"]
+    image: rapidocr-service:gpu
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    ports:
+      - "9003:9003"
+    environment:
+      TZ: Asia/Shanghai
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OCR_WORKERS: ${OCR_WORKERS:-1}
+    command:
+      [
+        "sh",
+        "-c",
+        "exec rapidocr_api -ip 0.0.0.0 -p 9003 -workers $${OCR_WORKERS}",
+      ]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s

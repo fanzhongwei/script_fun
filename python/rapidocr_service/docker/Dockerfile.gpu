@@ -1,0 +1,49 @@
+FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST="mirrors.aliyun.com pypi.tuna.tsinghua.edu.cn"
+
+WORKDIR /app
+
+COPY docker/pip.conf /etc/pip.conf
+
+# Ubuntu 22.04 自带 Python 3.10，无需 deadsnakes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        libglib2.0-0 \
+        libgomp1 \
+        libgl1 \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY versions.env /tmp/versions.env
+
+# 先装依赖并按 CPU 配置预热模型（构建机无需 GPU）
+COPY docker/warmup_models.py /tmp/warmup_models.py
+RUN set -eux; \
+    . /tmp/versions.env; \
+    python3 -m pip install --no-cache-dir --upgrade pip; \
+    pip3 install --no-cache-dir \
+        "rapidocr_api==${RAPIDOCR_API_VERSION}" \
+        "rapidocr==${RAPIDOCR_VERSION}"; \
+    pip3 uninstall -y onnxruntime onnxruntime-gpu || true; \
+    pip3 install --no-cache-dir "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"; \
+    pip3 uninstall -y opencv-python || true; \
+    pip3 install --no-cache-dir opencv-python-headless; \
+    python3 /tmp/warmup_models.py; \
+    rm -f /tmp/warmup_models.py /tmp/versions.env
+
+COPY docker/enable_ort_cuda.py /tmp/enable_ort_cuda.py
+RUN python3 /tmp/enable_ort_cuda.py && rm -f /tmp/enable_ort_cuda.py
+
+EXPOSE 9003
+
+CMD ["rapidocr_api", "-ip", "0.0.0.0", "-p", "9003", "-workers", "1"]

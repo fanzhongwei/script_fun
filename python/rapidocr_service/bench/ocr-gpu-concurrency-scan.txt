@@ -1,0 +1,88 @@
+RapidOCR GPU 客户端并发扫描报告
+时间: 2026-09-11 14:08 起跑（日志截取至 concurrency=11 开跑前）
+镜像/容器: rapidocr-service:gpu / rapidocr-service-gpu-1
+入口: 官方 rapidocr_api（OCR_WORKERS=1）
+接口: POST http://127.0.0.1:9003/ocr
+样图: /path/to/image-pages
+页数: 110  每页 1 次  单请求超时: 180s
+扫描: 客户端并发从 3 起每次 +1；本报告只整理已完成的 3～10（按约定不再往上）
+GPU: NVIDIA GeForce GTX 1080 Ti，11264 MiB
+中止原因: 未触发 CUDA/OOM；concurrency=11 已开跑但未出 QPS，按上限 10 收束
+
+  conc     QPS   wall_s   ok  fail   avg_ms      p95    oom  开跑前显存
+--------------------------------------------------------------------------------
+     3    2.38     46.2  110     0     1251     2006     no   1113 MiB
+     4    2.86     38.4  110     0     1388     2345     no   4408 MiB
+     5    3.12     35.2  110     0     1583     2912     no   5494 MiB
+     6    3.52     31.2  110     0     1683     3044     no   6621 MiB
+     7    3.45     31.9  110     0     2004     3626     no   6645 MiB
+     8    3.89     28.3  110     0     2015     3580     no   7775 MiB
+     9    3.60     30.6  110     0     2458     4763     no   7800 MiB
+    10    4.04     27.2  110     0     2392     4261     no   8929 MiB
+    11      —        —    —     —        —        —      —  10081 MiB（仅开跑前，本档未完成）
+
+结论:
+  无失败的最高已完成并发: 10
+  无失败时最高 QPS: 4.04 @ concurrency=10
+  3～10 全部 success=110、failures=0、oom=False，容器均为 running healthy
+  本轮未出现 CUDA/OOM，因此没有「OOM 中止档」
+  显存随并发上升：3→10 开跑前从 1113 MiB 增至 8929 MiB；11 开跑前已 10081 MiB / 11264 MiB，再往上接近卡满，OOM 风险明显变大
+
+分档详情
+
+--- concurrency=3 ---
+  QPS=2.38 wall_s=46.2 success=110 failures=0
+  avg_ms=1251 p95_ms=2006 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 1113 MiB, 11264 MiB, 24 %
+  容器状态: running healthy
+
+--- concurrency=4 ---
+  QPS=2.86 wall_s=38.4 success=110 failures=0
+  avg_ms=1388 p95_ms=2345 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 4408 MiB, 11264 MiB, 16 %
+  容器状态: running healthy
+
+--- concurrency=5 ---
+  QPS=3.12 wall_s=35.2 success=110 failures=0
+  avg_ms=1583 p95_ms=2912 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 5494 MiB, 11264 MiB, 20 %
+  容器状态: running healthy
+
+--- concurrency=6 ---
+  QPS=3.52 wall_s=31.2 success=110 failures=0
+  avg_ms=1683 p95_ms=3044 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 6621 MiB, 11264 MiB, 19 %
+  容器状态: running healthy
+
+--- concurrency=7 ---
+  QPS=3.45 wall_s=31.9 success=110 failures=0
+  avg_ms=2004 p95_ms=3626 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 6645 MiB, 11264 MiB, 20 %
+  容器状态: running healthy
+
+--- concurrency=8 ---
+  QPS=3.89 wall_s=28.3 success=110 failures=0
+  avg_ms=2015 p95_ms=3580 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 7775 MiB, 11264 MiB, 19 %
+  容器状态: running healthy
+
+--- concurrency=9 ---
+  QPS=3.60 wall_s=30.6 success=110 failures=0
+  avg_ms=2458 p95_ms=4763 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 7800 MiB, 11264 MiB, 14 %
+  容器状态: running healthy
+
+--- concurrency=10 ---
+  QPS=4.04 wall_s=27.2 success=110 failures=0
+  avg_ms=2392 p95_ms=4261 oom=False
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 8929 MiB, 11264 MiB, 19 %
+  容器状态: running healthy
+
+--- concurrency=11（未完成，不计入结论）---
+  压测前 GPU: NVIDIA GeForce GTX 1080 Ti, 10081 MiB, 11264 MiB, 9 %
+  无 QPS / 失败数 / OOM 判定
+
+说明:
+  原始日志未打印 p50/p99 与压测后 nvidia-smi，表中仅含日志里有的指标。
+  官方 rapidocr_api 单 worker 下，客户端并发会在同一进程线程池里叠推理，故 QPS 随并发上升、延迟也变长；本卡在 conc=10 仍成功。
+  建议生产并发按 10 以内使用；若还要试 11+，需单独跑并盯显存（开跑前已约 10 GB / 11 GB）。

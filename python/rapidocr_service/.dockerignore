@@ -1,0 +1,6 @@
+README.md
+bench
+scripts
+.git
+**/__pycache__
+**/*.pyc
