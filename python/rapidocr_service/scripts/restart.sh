@@ -52,4 +52,4 @@ cd "${ROOT}"
 compose -f "${COMPOSE_FILE}" --profile cpu down --remove-orphans || true
 compose -f "${COMPOSE_FILE}" --profile gpu down --remove-orphans || true
 compose -f "${COMPOSE_FILE}" --profile "${PROFILE}" up -d --force-recreate --no-build
-echo "OCR 服务: http://127.0.0.1:9003/ocr  文档: http://127.0.0.1:9003/docs"
+echo "OCR API: http://127.0.0.1:9003/ocr  文档: http://127.0.0.1:9003/docs  页面: http://127.0.0.1:9004/"

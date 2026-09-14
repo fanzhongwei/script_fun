@@ -1,8 +1,8 @@
 # RapidOCR HTTP 服务
 
-基于 [RapidOCR](https://github.com/RapidAI/RapidOCR) 与官方 PyPI 包 [`rapidocr_api`](https://github.com/RapidAI/RapidOCRAPI) 的 Docker OCR 服务：单图 `POST /ocr`，CPU / GPU 双镜像，构建后可离线运行。
+基于 [RapidOCR](https://github.com/RapidAI/RapidOCR) 与官方 PyPI 包 [`rapidocr_api`](https://github.com/RapidAI/RapidOCRAPI) 的 Docker OCR 服务：单图 `POST /ocr`，CPU / GPU 双镜像，构建后可离线运行；另提供改造自 [RapidOCRWeb](https://github.com/RapidAI/RapidOCRWeb) 的浏览器页面（转发到 9003，不在 Web 进程加载模型）。
 
-**不要使用 RapidOCRAPI 仓库里的官方 Dockerfile**（依赖陈旧，仅为 CPU）。本目录自行维护 `docker/Dockerfile.cpu` 与 `docker/Dockerfile.gpu`。
+**不要使用 RapidOCRAPI 仓库里的官方 Dockerfile**（依赖陈旧，仅为 CPU）。本目录自行维护 `docker/Dockerfile.cpu`、`docker/Dockerfile.gpu` 与 `docker/Dockerfile.web`。
 
 ## 环境依赖说明
 
@@ -16,12 +16,14 @@
 - **GPU 镜像**：本机 NVIDIA 驱动 + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)；CUDA 基础镜像为 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`
 - **压测**：宿主机 `python3-dev`（标准库即可，无需再装 pip 包）
 - **包版本**：见同目录 `versions.env`（`rapidocr_api` / `rapidocr` / `onnxruntime` / `onnxruntime-gpu` 钉死）
+- **Web 基础镜像**：`python:3.12-bookworm`（与 CPU 相同；目标本为 slim，拉不到时回退）。pip 钉死 `Flask==3.0.0`、`opencv-python-headless==4.10.0.84`（不装 `rapidocr`）
+- **Web 源码**：`web/`（compose volume 挂到容器 `/app`），改适配逻辑后重启 web 即可，不必重建 OCR 镜像
 
 ## 脚本参数说明
 
 ### 启动 `scripts/run.sh`
 
-无参数。自动检测本机 NVIDIA（`nvidia-smi -L`、`/dev/nvidia0` 或 `/dev/nvidiactl`、内核模块 `nvidia`、`lspci` 含 nvidia 或 `10de`），有则起 GPU 容器，否则起 CPU 容器。监听 **9003**。
+无参数。自动检测本机 NVIDIA（`nvidia-smi -L`、`/dev/nvidia0` 或 `/dev/nvidiactl`、内核模块 `nvidia`、`lspci` 含 nvidia 或 `10de`），有则起 GPU 容器，否则起 CPU 容器。同时启动 Web。API 监听 **9003**，页面监听 **9004**。
 
 ```bash
 cd python/rapidocr_service
@@ -30,7 +32,7 @@ cd python/rapidocr_service
 
 ### 重启 `scripts/restart.sh`
 
-无参数。检测逻辑与 `run.sh` 相同。先停掉 cpu/gpu 两个 profile 的容器（避免抢 9003），再按检测结果 `up -d --force-recreate --no-build`，**不重新构建镜像**。`OCR_WORKERS` 等环境变量在重启时生效。
+无参数。检测逻辑与 `run.sh` 相同。先停掉 cpu/gpu 两个 profile 的容器（避免抢 9003；web 同属这两个 profile），再按检测结果 `up -d --force-recreate --no-build`，**不重新构建镜像**。`OCR_WORKERS` 等环境变量在重启时生效。改了 `web/` 下适配代码时重启即可生效（volume 挂载）。
 
 ```bash
 cd python/rapidocr_service
@@ -63,6 +65,8 @@ curl -F image_file=@bench/sample.png http://127.0.0.1:9003/ocr
 
 也可用表单 `image_data` 传图片 base64。Swagger：`http://127.0.0.1:9003/docs`。
 
+浏览器页面：`http://127.0.0.1:9004/`（上传后由 Web 转发到上述 `/ocr`）。映射自检：`python3-dev web/check_map.py`。
+
 ## 使用配置说明
 
 包版本在 `versions.env`，两份 Dockerfile 构建时 `source` 该文件。升级版本后须重新构建，并确认 GPU 镜像仍将 `EngineConfig.onnxruntime.use_cuda` 设为 `true`。
@@ -84,7 +88,9 @@ docker-compose -f docker/compose.yml --profile cpu build
 docker-compose -f docker/compose.yml --profile gpu build
 ```
 
-Compose 端口映射：`9003:9003`。CPU / GPU 均用官方命令 `rapidocr_api`。CPU 默认 **4** 个 worker（`OCR_WORKERS`）；GPU 默认 **1**，减少多进程抢同一张卡。GPU 高并发时官方入口会在同一进程的线程池里并行推理，吞吐更高，但可能触发 CUDA 显存分配失败，可把 `OCR_WORKERS` 保持为 1 或调低客户端并发。构建 pip 默认国内源；临时换源覆盖 `PIP_INDEX_URL`。
+Compose 端口映射：API `9003:9003`，Web `9004:9004`。CPU / GPU 均用官方命令 `rapidocr_api`，并共用网络别名 `ocr-api` 供 Web 访问。CPU 默认 **4** 个 worker（`OCR_WORKERS`）；GPU 默认 **1**，减少多进程抢同一张卡。GPU 高并发时官方入口会在同一进程的线程池里并行推理，吞吐更高，但可能触发 CUDA 显存分配失败，可把 `OCR_WORKERS` 保持为 1 或调低客户端并发。构建 pip 默认国内源；临时换源覆盖 `PIP_INDEX_URL`。
+
+`--profile cpu` 或 `--profile gpu` 时会一并构建/启动 `web`（`profiles: [cpu, gpu]`）。Web 环境变量 `RAPIDOCR_API_URL` 默认为 `http://ocr-api:9003/ocr`。
 
 GPU 镜像在构建时先按 CPU 配置下载模型，再改 RapidOCR 自带 `config.yaml` 的 `use_cuda`，这样无 GPU 的构建机也能完成预热。
 
@@ -113,3 +119,12 @@ A: 本服务不支持 ROCm。无 NVIDIA 时 `run.sh` 走 CPU 镜像。
 
 **Q: 会改水印去除脚本吗？**  
 A: 不会。本目录独立，不修改 `python/watermark_remover/`。
+
+**Q: 浏览器页面和 9003 是什么关系？**  
+A: 页面在 9004，识别请求由 Web 容器转发到 `ocr-api:9003/ocr`（即当前 CPU 或 GPU 的 `rapidocr_api`）。不要把 RapidOCRWeb 源码挂进 OCR 容器替代 API。
+
+**Q: 页面上的分阶段耗时为什么是 0？**  
+A: 官方 `rapidocr_api` 不返回 det/cls/rec 分段耗时。总耗时为 Web 调用 API 的往返时间。
+
+**Q: Web 改了代码要重新构建 OCR 镜像吗？**  
+A: 不用。`web/` 通过 compose volume 挂进 Web 容器，重启 web 即可。只有改 Flask/OpenCV 版本才重建 `Dockerfile.web`。

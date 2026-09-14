@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RapidOCR - 智能文字识别</title>
+    <link rel="stylesheet" type="text/css" href="/static/css/main.css">
+    <link rel="shortcut icon" href="/static/css/favicon.ico" type="image/x-icon" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <!-- 头部区域 -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="main-title">
+                    <i class="fas fa-eye"></i>
+                    RapidOCR
+                    <span class="subtitle">智能文字识别</span>
+                </h1>
+                <div class="header-links">
+                    <a href="https://github.com/RapidAI/RapidOCRWeb" class="github-link" target="_blank">
+                        <i class="fab fa-github"></i>
+                        Star项目
+                    </a>
+                    <a href="https://rapidai.github.io/RapidOCRDocs/main/install_usage/rapidocr_web/usage/"
+                        class="docs-link" target="_blank">
+                        <i class="fas fa-book"></i>
+                        使用文档
+                    </a>
+                </div>
+            </div>
+        </header>
+
+        <!-- 上传区域 -->
+        <section class="upload-section">
+            <div class="upload-container" id="uploadContainer">
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </div>
+                    <h3 class="upload-title">粘贴剪贴板图像、拖拽图片或点击上传</h3>
+                    <p class="upload-subtitle">支持 PNG、JPG、JPEG、BMP、WEBP 格式，文件大小不超过 3MB</p>
+                    <button class="upload-btn" onclick="document.getElementById('rapid_ocr').click();">
+                        <i class="fas fa-plus"></i>
+                        选择图片
+                    </button>
+                    <input type="file" style="display: none;" name="pic" id="rapid_ocr" accept="image/*" />
+                </div>
+            </div>
+        </section>
+
+        <!-- 结果展示区域 -->
+        <section class="results-section" id="resultsSection" style="display: none;">
+            <div class="results-container">
+                <!-- 左侧：检测结果 -->
+                <div class="result-panel image-panel">
+                    <div class="panel-header">
+                        <div class="header-title">
+                            <i class="fas fa-search"></i>
+                            <span>文本检测结果</span>
+                            <span id="det_time" class="total-time" style="display: none;"></span>
+                        </div>
+                    </div>
+                    <div class="panel-content image-panel-content">
+                        <div class="loading-overlay" id="loadingOverlay">
+                            <div class="loading-spinner">
+                                <i class="fas fa-spinner fa-spin"></i>
+                                <p>正在识别中...</p>
+                            </div>
+                        </div>
+                        <div class="image-viewport" id="imageViewport">
+                            <div class="image-stage" id="imageStage">
+                                <img id="detect_img" src="" alt="检测结果" />
+                                <svg id="boxOverlay" class="box-overlay"></svg>
+                            </div>
+                        </div>
+                        <div class="zoom-hint">
+                            <i class="fas fa-search-plus"></i> 滚轮缩放，拖拽移动，双击复位
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 右侧：识别结果 -->
+                <div class="result-panel text-panel">
+                    <div class="panel-header">
+                        <div class="header-title">
+                            <i class="fas fa-file-text"></i>
+                            <span id="rec_res">文本识别结果</span>
+                            <span id="rec_time" class="total-time" style="display: none;"></span>
+                        </div>
+                        <div class="header-actions">
+                            <button class="copy-all-btn" id="copyAllBtn" style="display: none;">
+                                <i class="fas fa-copy"></i>
+                                <span>复制全部</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="panel-content text-panel-content">
+                        <div class="table-container">
+                            <table id="locTable" class="result-table"></table>
+                        </div>
+                        <div class="full-text-box" id="fullTextBox" style="display: none;">
+                            <div class="full-text-header">全部文本</div>
+                            <pre id="fullText"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="{{url_for('static', filename='js/jquery-3.0.0.min.js')}}"></script>
+    <script src="{{url_for('static', filename='js/app.js')}}"></script>
+    <script type="text/javascript">
+        // 页面加载时，执行
+        var targetFile = null;
+        window.onload = function () {
+            $('#copyAllBtn').hide();
+            $('#copyAllBtn').on('click', function () {
+                copyAllResults();
+            });
+            window.copyAllResults = copyAllResults;
+            if (typeof initImageViewer === 'function') {
+                initImageViewer();
+            }
+        }
+
+        $("#rapid_ocr").on('change', function () {
+            targetFile = document.getElementById("rapid_ocr").files[0];
+            requestOCR();
+        });
+
+        // 拖拽上传
+        $("html").on("dragover", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            $(this).addClass('dragging');
+        });
+
+        $("html").on("dragleave", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            $(this).removeClass('dragging');
+        });
+
+        $("html").on("drop", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            let trans = event.originalEvent.dataTransfer;
+            handleData(trans);
+        });
+
+        // 粘贴上传
+        $('html').on('paste', function (e) {
+            let trans = e.originalEvent.clipboardData;
+            handleData(trans);
+        });
+
+        function handleData(trans) {
+            if (trans.items) {
+                for (let i = 0; i < trans.items.length; i++) {
+                    if (trans.items[i].kind === 'file') {
+                        targetFile = trans.items[i].getAsFile();
+                        console.log(`handleData: items[${i}].name = ${targetFile.name}`);
+                        requestOCR();
+                        return;
+                    }
+                }
+            } else {
+                for (let i = 0; i < trans.files.length; i++) {
+                    targetFile = trans.files[i];
+                    console.log(`handleData: files[${i}].name = ${targetFile.name}`);
+                    requestOCR();
+                    return;
+                }
+            }
+        }
+
+        function requestOCR() {
+            if (!targetFile) {
+                return;
+            }
+
+            // 判断图像格式是否匹配
+            let imageName = targetFile.name;
+            let index = imageName.lastIndexOf('.');
+            let extName = imageName.substr(index + 1);
+            let imgArr = ['webp', 'jpg', 'bmp', 'png', 'jpeg'];
+            if (!(imgArr.includes(extName.toLocaleLowerCase()))) {
+                showNotification("图像文件格式不支持！", "error");
+                return;
+            }
+
+            // 判断图像大小是否符合
+            let imageSize = targetFile.size / 1024 / 1024;
+            if (imageSize >= 3) {
+                showNotification("图像大小超过3MB！", "error");
+                return;
+            }
+
+            var reader = new FileReader();
+            reader.onload = function (e) {
+                var upload_data = { "file": reader.result };
+                $.ajax({
+                    url: "/ocr",
+                    type: "POST",
+                    data: JSON.stringify(upload_data),
+                    contentType: 'application/json; charset=UTF-8',
+                    dataType: 'json',
+
+                    beforeSend: function () {
+                        $("#resultsSection").show();
+                        $("#loadingOverlay").show();
+                        $("#locTable").hide();
+                        $("#fullTextBox").hide();
+                        $("#copyAllBtn").hide().removeClass('copied').html('<i class="fas fa-copy"></i><span>复制全部</span>');
+                        $("#detect_img").attr('src', reader.result).show();
+                        if (typeof resetImageView === 'function') {
+                            resetImageView();
+                        }
+                        var recResElement = document.getElementById("rec_res");
+                        var recTimeElement = document.getElementById("rec_time");
+                        var detTimeElement = document.getElementById("det_time");
+                        if (recResElement) {
+                            recResElement.textContent = '文本识别结果';
+                            recResElement.style.display = 'inline';
+                        }
+                        if (recTimeElement) {
+                            recTimeElement.style.display = 'none';
+                        }
+                        if (detTimeElement) {
+                            detTimeElement.style.display = 'none';
+                        }
+                    },
+
+                    success: function (data) {
+                        $("#loadingOverlay").hide();
+
+                        if (data) {
+                            if (data['image']) {
+                                $("#detect_img").attr('src', 'data:image/png;base64,' + data['image']).show();
+                            }
+
+                            if (data["det_elapse"]) {
+                                var detTimeElement = document.getElementById("det_time");
+                                if (detTimeElement) {
+                                    detTimeElement.textContent = '(耗时: ' + String(data["det_elapse"]) + 's)';
+                                    detTimeElement.style.display = 'inline';
+                                }
+                            }
+                            if (data["total_elapse"]) {
+                                var recTimeElement = document.getElementById("rec_time");
+                                if (recTimeElement) {
+                                    recTimeElement.textContent = '(接口: ' + String(data["total_elapse"]) + 's)';
+                                    recTimeElement.style.display = 'inline';
+                                }
+                            }
+
+                            if (data["rec_res"]) {
+                                var rec_res = JSON.parse(data["rec_res"]);
+                                renderOcrResults(rec_res);
+                                $("#copyAllBtn").show();
+                                document.getElementById('resultsSection').scrollIntoView({
+                                    behavior: 'smooth',
+                                    block: 'start'
+                                });
+                                requestAnimationFrame(function () {
+                                    if (typeof resetImageView === 'function') {
+                                        resetImageView();
+                                    }
+                                });
+                                setTimeout(function () {
+                                    if (typeof resetImageView === 'function') {
+                                        resetImageView();
+                                    }
+                                }, 400);
+                            }
+                        }
+                    },
+
+                    error: function (xhr, status, error) {
+                        $("#loadingOverlay").hide();
+                        showNotification("识别失败，请重试", "error");
+                    }
+                });
+            }
+            reader.readAsDataURL(targetFile)
+        }
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function renderOcrResults(rec_res) {
+            var tableData = "<thead><tr>" +
+                '<th>序号</th>' +
+                '<th>识别结果</th>' +
+                '<th>位置坐标</th>' +
+                '<th>置信度</th>' +
+                "</tr></thead><tbody>";
+            var lines = [];
+            for (let i = 0; i < rec_res.length; i++) {
+                const element = rec_res[i];
+                let num = element[0];
+                let rec_result = element[1];
+                let score = Number(element[2]).toFixed(4);
+                let xywh = element[3] || '';
+                let pts = element[4] || [];
+                let confidenceClass = score > 0.8 ? 'high-confidence' :
+                    score > 0.6 ? 'medium-confidence' : 'low-confidence';
+                tableData += "<tr data-idx='" + num + "'>";
+                tableData += "<td class='row-number'>" + num + "</td>";
+                tableData += "<td class='recognition-result'>" + escapeHtml(rec_result) + "</td>";
+                tableData += "<td class='box-coord'>" + escapeHtml(xywh) + "</td>";
+                tableData += "<td class='confidence-score " + confidenceClass + "'>" + score + "</td>";
+                tableData += "</tr>";
+                if (rec_result) {
+                    lines.push(rec_result);
+                }
+                rec_res[i]._pts = pts;
+            }
+            tableData += "</tbody>";
+            document.getElementById("locTable").innerHTML = tableData;
+            $("#locTable").show();
+            document.getElementById("fullText").textContent = lines.join('\n');
+            $("#fullTextBox").show();
+            bindResultHover();
+            if (typeof drawBoxOverlay === 'function') {
+                drawBoxOverlay(rec_res);
+            }
+        }
+
+        function bindResultHover() {
+            const table = document.getElementById('locTable');
+            if (!table) {
+                return;
+            }
+            $(table).off('mouseenter.ocr mouseleave.ocr', 'tbody tr');
+            $(table).on('mouseenter.ocr', 'tbody tr', function () {
+                highlightBox($(this).data('idx'));
+            });
+            $(table).on('mouseleave.ocr', 'tbody tr', function () {
+                highlightBox(null);
+            });
+        }
+
+        function highlightBox(idx) {
+            document.querySelectorAll('#boxOverlay .ocr-box').forEach(function (el) {
+                el.classList.toggle('active', idx != null && String(el.dataset.idx) === String(idx));
+            });
+            document.querySelectorAll('#locTable tbody tr').forEach(function (el) {
+                el.classList.toggle('row-active', idx != null && String(el.dataset.idx) === String(idx));
+            });
+        }
+
+        // 调整图像尺寸，保持宽高比 - 使用新的自适应函数
+        function adjustImageSize(imgElement) {
+            return;
+        }
+
+        // 复制所有识别结果
+        function copyAllResults() {
+            console.log('copyAllResults function called');
+
+            try {
+                const table = document.getElementById('locTable');
+                console.log('Table element:', table);
+
+                if (!table) {
+                    showNotification("找不到结果表格", "error");
+                    return;
+                }
+
+                if (table.style.display === 'none') {
+                    showNotification("结果表格未显示", "error");
+                    return;
+                }
+
+                const rows = table.querySelectorAll('tbody tr');
+                console.log('Found', rows.length, 'rows');
+
+                if (rows.length === 0) {
+                    showNotification("没有可复制的识别结果", "error");
+                    return;
+                }
+
+                // 收集所有识别结果
+                let allText = '';
+
+                rows.forEach((row, index) => {
+                    const textCell = row.querySelector('.recognition-result');
+                    console.log('Row', index, 'textCell:', textCell);
+                    if (textCell) {
+                        const text = textCell.textContent.trim();
+                        console.log('Row', index, 'text:', text);
+                        if (text) {
+                            allText += text + '\n';
+                        }
+                    }
+                });
+
+                // 移除最后的换行符
+                allText = allText.trim();
+                console.log('Final text to copy:', allText);
+
+                if (!allText) {
+                    showNotification("没有可复制的文本内容", "error");
+                    return;
+                }
+
+                // 尝试使用现代API复制
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(allText).then(() => {
+                        updateCopyButtonSuccess(rows.length);
+                    }).catch((err) => {
+                        console.log('Clipboard API failed, using fallback:', err);
+                        fallbackCopy(allText, rows.length);
+                    });
+                } else {
+                    console.log('Clipboard API not available, using fallback');
+                    fallbackCopy(allText, rows.length);
+                }
+
+            } catch (error) {
+                console.error('Error in copyAllResults:', error);
+                showNotification("复制过程中出现错误", "error");
+            }
+        }
+
+        // 降级复制方法
+        function fallbackCopy(text, rowCount) {
+            try {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-999999px';
+                textArea.style.top = '-999999px';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+
+                const successful = document.execCommand('copy');
+                document.body.removeChild(textArea);
+
+                if (successful) {
+                    updateCopyButtonSuccess(rowCount);
+                } else {
+                    showNotification("复制失败，请手动选择文本", "error");
+                }
+            } catch (err) {
+                console.error('Fallback copy failed:', err);
+                showNotification("复制失败，请手动选择文本", "error");
+            }
+        }
+
+        // 更新复制按钮成功状态
+        function updateCopyButtonSuccess(rowCount) {
+            const copyBtn = document.getElementById('copyAllBtn');
+            if (copyBtn) {
+                copyBtn.classList.add('copied');
+                copyBtn.innerHTML = '<i class="fas fa-check"></i><span>已复制</span>';
+
+                showNotification(`已复制 ${rowCount} 条识别结果`, "success");
+
+                // 3秒后恢复按钮状态
+                setTimeout(() => {
+                    copyBtn.classList.remove('copied');
+                    copyBtn.innerHTML = '<i class="fas fa-copy"></i><span>复制全部</span>';
+                }, 3000);
+            }
+        }
+
+        function showNotification(message, type) {
+            // 创建通知元素
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.innerHTML = `
+                <i class="fas fa-${type === 'error' ? 'exclamation-triangle' : 'check-circle'}"></i>
+                <span>${message}</span>
+            `;
+
+            document.body.appendChild(notification);
+
+            // 显示动画
+            setTimeout(() => notification.classList.add('show'), 100);
+
+            // 自动隐藏
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => document.body.removeChild(notification), 300);
+            }, 3000);
+        }
+    </script>
+</body>
+
+</html>

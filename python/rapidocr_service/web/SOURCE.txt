@@ -1,0 +1,3 @@
+来源：https://github.com/RapidAI/RapidOCRWeb（Apache-2.0，见 LICENSE）
+本目录仅保留运行所需 Flask 页面与静态资源；`ocrweb_multi` 与打包 spec 未纳入。
+`map_result.py` / `task.py` 为本仓库适配，识别转发到 rapidocr_api。

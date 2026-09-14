@@ -9,6 +9,10 @@ services:
       dockerfile: docker/Dockerfile.cpu
     ports:
       - "9003:9003"
+    networks:
+      default:
+        aliases:
+          - ocr-api
     environment:
       TZ: Asia/Shanghai
       OCR_WORKERS: ${OCR_WORKERS:-4}
@@ -39,6 +43,10 @@ services:
       dockerfile: docker/Dockerfile.gpu
     ports:
       - "9003:9003"
+    networks:
+      default:
+        aliases:
+          - ocr-api
     environment:
       TZ: Asia/Shanghai
       NVIDIA_VISIBLE_DEVICES: all
@@ -69,3 +77,29 @@ services:
       timeout: 5s
       retries: 12
       start_period: 60s
+
+  web:
+    profiles: ["cpu", "gpu"]
+    image: rapidocr-service:web
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    ports:
+      - "9004:9004"
+    volumes:
+      - ../web:/app
+    environment:
+      TZ: Asia/Shanghai
+      RAPIDOCR_API_URL: http://ocr-api:9003/ocr
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9004/', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

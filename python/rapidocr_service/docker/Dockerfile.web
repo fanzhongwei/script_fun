@@ -1,0 +1,29 @@
+FROM python:3.12-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST="mirrors.aliyun.com pypi.tuna.tsinghua.edu.cn"
+
+WORKDIR /app
+
+COPY docker/pip.conf /etc/pip.conf
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libgomp1 \
+        libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+        "Flask==3.0.0" \
+        "opencv-python-headless==4.10.0.84"
+
+EXPOSE 9004
+
+CMD ["python", "rapidocr_web/ocrweb.py", "-ip", "0.0.0.0", "-p", "9004"]
