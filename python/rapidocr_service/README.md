@@ -41,6 +41,15 @@ cd python/rapidocr_service
 OCR_WORKERS=1 ./scripts/restart.sh
 ```
 
+### 停止 `scripts/stop.sh`
+
+无参数。停掉 cpu/gpu 两个 profile 的容器（含 web），避免只停一侧后仍占用 9003/9004。不删除镜像。
+
+```bash
+cd python/rapidocr_service
+./scripts/stop.sh
+```
+
 ### 压测 `bench/bench.py`
 
 | 参数 | 说明 | 默认 |
