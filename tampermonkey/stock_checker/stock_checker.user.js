@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         1688库存检查
 // @namespace    https://github.com/fanzhongwei/script_fun
-// @version      1.2.11
-// @description  爱用分销商品管理：核对店铺 SKU 与 1688 货源库存，导出双 Sheet Excel
+// @version      1.4.0
+// @description  爱用分销商品管理：在规格匹配页核对店铺 SKU 与货源库存、货源价，导出库存与价格 Sheet
 // @author       script_fun
 // @match        *://light-app.1688.com/*
 // @require      https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.min.js
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -22,6 +24,7 @@
   const BTN_ID = 'sc-check-btn';
   const INJECTED_ATTR = 'data-sc-stock-check';
   const PENDING_RESULTS = new Set(['库存异常', '库存告急', '补充库存']);
+  const PENDING_PRICE = new Set(['涨价', '降价', '换绑']);
   const EXCEL_HEADERS = [
     '店铺商品ID', '店铺商品名', '店铺SKU名', '店铺库存', '是否上架',
     '检查结果', '货源库存', '货源SKU名', '货源名称', '货源供应商',
@@ -29,6 +32,13 @@
   const MERGE_COLS = [0, 1, 8, 9];
   /** 列宽按列头字数，保证表头可见即可 */
   const EXCEL_COL_WIDTHS = [16, 14, 16, 12, 12, 12, 12, 16, 12, 14];
+  const PRICE_HEADERS = [
+    '店铺商品ID', '店铺商品名', '店铺SKU名', '货源SKU名',
+    '上次货源价', '本次货源价', '涨跌', '涨跌额', '货源名称', '货源供应商',
+  ];
+  const PRICE_MERGE_COLS = [0, 1, 8, 9];
+  const PRICE_COL_WIDTHS = [16, 14, 16, 16, 14, 14, 12, 12, 12, 14];
+  const PRICE_STORE_PREFIX = 'sc-source-price:v1:';
 
   let running = false;
 
@@ -71,6 +81,84 @@
     return '库存正常';
   }
 
+  function gmGet(key, fallback) {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
+    } catch (_) { /* ignore */ }
+    return fallback;
+  }
+
+  function gmSet(key, value) {
+    if (typeof GM_setValue !== 'function') throw new Error('缺少 GM_setValue');
+    GM_setValue(key, value);
+  }
+
+  function yuanTextFromFen(fen) {
+    if (fen == null || fen === '') return '';
+    return (Number(fen) / 100).toFixed(2);
+  }
+
+  function formatDelta(deltaFen) {
+    const text = (deltaFen / 100).toFixed(2);
+    if (deltaFen > 0) return '+' + text;
+    return text;
+  }
+
+  function compareSourcePrice(prev, currentFen, currentSkuName) {
+    if (currentFen == null) {
+      return { change: '无货源价', delta: '', prevFen: prev && prev.p != null ? prev.p : null, currentFen: null };
+    }
+    if (!prev || prev.p == null) {
+      return { change: '首次', delta: '', prevFen: null, currentFen: currentFen };
+    }
+    const prevSku = String(prev.sku || '').trim();
+    const curSku = String(currentSkuName || '').trim();
+    const deltaFen = currentFen - Number(prev.p);
+    if (prevSku && curSku && prevSku !== curSku) {
+      return { change: '换绑', delta: formatDelta(deltaFen), prevFen: prev.p, currentFen: currentFen };
+    }
+    if (deltaFen > 0) return { change: '涨价', delta: formatDelta(deltaFen), prevFen: prev.p, currentFen: currentFen };
+    if (deltaFen < 0) return { change: '降价', delta: formatDelta(deltaFen), prevFen: prev.p, currentFen: currentFen };
+    return { change: '持平', delta: '0', prevFen: prev.p, currentFen: currentFen };
+  }
+
+  function priceStoreKey(shopName) {
+    return PRICE_STORE_PREFIX + String(shopName || '未知店铺');
+  }
+
+  function skuPriceKey(productId, skuName) {
+    return String(productId || '') + '\0' + String(skuName || '');
+  }
+
+  function loadShopPrices(shopName) {
+    const raw = gmGet(priceStoreKey(shopName), null);
+    if (!raw || typeof raw !== 'object') return {};
+    return raw;
+  }
+
+  function applyPriceSnapshot(shopName, rows) {
+    if (!rows || !rows.length) return rows;
+    if (rows.some((r) => r._fail || r.result === '检查失败')) return rows;
+    const store = loadShopPrices(shopName);
+    const next = Object.assign({}, store);
+    let changed = false;
+    rows.forEach((row) => {
+      const key = skuPriceKey(row.shopProductId, row.shopSkuName);
+      const prev = store[key] || null;
+      const cmp = compareSourcePrice(prev, row._priceFen == null ? null : row._priceFen, row.sourceSkuName);
+      row.priceChange = cmp.change;
+      row.priceDelta = cmp.delta;
+      row.prevPrice = yuanTextFromFen(cmp.prevFen);
+      row.currentPrice = yuanTextFromFen(cmp.currentFen);
+      if (row._priceFen != null) {
+        next[key] = { p: row._priceFen, sku: row.sourceSkuName || '', at: new Date().toISOString() };
+        changed = true;
+      }
+    });
+    if (changed) gmSet(priceStoreKey(shopName), next);
+    return rows;
+  }
+
   function ensureOverlay() {
     let el = document.getElementById(ROOT_ID);
     if (el) return el;
@@ -80,7 +168,7 @@
       'background:#fff;border:1px solid #d9d9d9;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.15);',
       'padding:12px 14px;font-size:13px;color:#333;font-family:inherit;pointer-events:none;}',
       '#sc-overlay .sc-title{font-weight:600;margin-bottom:6px;}',
-      '#sc-overlay .sc-line{line-height:1.6;}',
+      '#sc-overlay .sc-line{line-height:1.6;word-break:break-all;}',
       '#sc-overlay .sc-actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;pointer-events:auto;}',
       '#sc-overlay button{cursor:pointer;pointer-events:auto;}',
       '#sc-check-btn{margin-left:8px;}',
@@ -475,6 +563,9 @@
     const selectedText = selectedSourceText(specCell);
     const sourceStock = parseStock(textOf(specCell.querySelector('.product-specs-card-info-stock')));
     const sourceSkuName = linked ? parseSourceSkuName(selectedText) : '';
+    const priceNode = specCell.querySelector('.product-specs-card-info-price .sku-info-price');
+    const priceMatch = textOf(priceNode).replace(/,/g, '').match(/(-?\d+(?:\.\d+)?)/);
+    const priceYuan = linked && priceMatch ? Number(priceMatch[1]) : null;
     const result = classifySku({
       linked,
       onSale,
@@ -493,6 +584,7 @@
       sourceName: linked ? sourceMeta.name : '',
       sourceSkuName,
       sourceStock: linked ? sourceStock : '',
+      _priceFen: priceYuan != null && Number.isFinite(priceYuan) ? Math.round(priceYuan * 100) : null,
     };
   }
 
@@ -572,7 +664,7 @@
     showProgress(head, extra);
     const collected = await collectAllSpecRows(shopName, { message: head, productTitle: extra });
     await leaveSpecMatchPage();
-    return collected.rows;
+    return applyPriceSnapshot(shopName, collected.rows);
   }
 
   async function inspectProductWithRetry(target, shopName, seq, shopTotal) {
@@ -641,7 +733,8 @@
     return out;
   }
 
-  function applyProductMerges(ws, dataRows) {
+  function applyProductMerges(ws, dataRows, mergeCols) {
+    const cols = mergeCols || MERGE_COLS;
     const merges = [];
     let i = 0;
     while (i < dataRows.length) {
@@ -651,7 +744,7 @@
       if (j - i > 1) {
         const start = i + 1;
         const end = j;
-        MERGE_COLS.forEach((c) => {
+        cols.forEach((c) => {
           merges.push({ s: { r: start, c: c }, e: { r: end, c: c } });
         });
       }
@@ -672,42 +765,92 @@
     return null;
   }
 
-  function applySheetLayout(ws, dataRows) {
-    applyProductMerges(ws, dataRows);
-    ws['!cols'] = EXCEL_COL_WIDTHS.map((wch) => ({ wch }));
+  function priceChangeFont(change) {
+    if (change === '涨价') return { color: { rgb: 'FFFF0000' } };
+    if (change === '降价') return { color: { rgb: 'FF008000' } };
+    if (change === '换绑') return { color: { rgb: 'FFED7D31' } };
+    return null;
+  }
+
+  function applySheetLayout(ws, dataRows, layout) {
+    const headers = layout.headers;
+    const widths = layout.widths;
+    const mergeCols = layout.mergeCols;
+    const priceCol = layout.priceCol;
+    applyProductMerges(ws, dataRows, mergeCols);
+    ws['!cols'] = widths.map((wch) => ({ wch }));
     ws['!views'] = [{ state: 'frozen', xSplit: 0, ySplit: 1, topLeftCell: 'A2', activeCell: 'A2' }];
     ws['!freeze'] = { xSplit: 0, ySplit: 1 };
     const vCenter = { alignment: { vertical: 'center', wrapText: true } };
     const headerStyle = { font: { bold: true }, alignment: { vertical: 'center', wrapText: true } };
-    EXCEL_HEADERS.forEach((_, c) => {
+    headers.forEach((_, c) => {
       const cell = ws[XLSX.utils.encode_cell({ r: 0, c: c })];
       if (cell) cell.s = headerStyle;
     });
     const lastRow = dataRows.length;
-    const colCount = EXCEL_HEADERS.length;
+    const colCount = headers.length;
     for (let r = 1; r <= lastRow; r += 1) {
-      const fill = resultRowFill(dataRows[r - 1].result);
+      const fill = layout.stockFill ? resultRowFill(dataRows[r - 1].result) : null;
+      const font = priceCol == null ? null : priceChangeFont(dataRows[r - 1].priceChange);
       for (let c = 0; c < colCount; c += 1) {
         const cell = ensureCell(ws, r, c);
         const style = {};
-        if (MERGE_COLS.indexOf(c) >= 0) Object.assign(style, vCenter);
+        if (mergeCols.indexOf(c) >= 0) Object.assign(style, vCenter);
         if (fill) style.fill = fill;
+        if (font && c === priceCol) style.font = font;
         if (Object.keys(style).length) cell.s = Object.assign({}, cell.s, style);
       }
     }
+  }
+
+  function priceRowToArray(row) {
+    return [
+      row.shopProductId,
+      row.shopProductName,
+      row.shopSkuName,
+      row.sourceSkuName || '',
+      row.prevPrice || '',
+      row.currentPrice || '',
+      row.priceChange || '',
+      row.priceDelta || '',
+      row.sourceName || '',
+      row.supplier || '',
+    ];
   }
 
   function buildWorkbook(rows) {
     if (typeof XLSX === 'undefined') throw new Error('未加载 SheetJS');
     const detail = groupRowsByProduct(rows);
     const pending = groupRowsByProduct(rows.filter((r) => PENDING_RESULTS.has(r.result)));
+    const priceRows = groupRowsByProduct(rows.filter((r) => r.result !== '检查失败'));
+    const pricePending = groupRowsByProduct(priceRows.filter((r) => PENDING_PRICE.has(r.priceChange)));
+    const stockLayout = {
+      headers: EXCEL_HEADERS,
+      widths: EXCEL_COL_WIDTHS,
+      mergeCols: MERGE_COLS,
+      stockFill: true,
+      priceCol: null,
+    };
+    const priceLayout = {
+      headers: PRICE_HEADERS,
+      widths: PRICE_COL_WIDTHS,
+      mergeCols: PRICE_MERGE_COLS,
+      stockFill: false,
+      priceCol: 6,
+    };
     const wb = XLSX.utils.book_new();
     const pendingSheet = XLSX.utils.aoa_to_sheet([EXCEL_HEADERS].concat(pending.map(rowToArray)));
     const detailSheet = XLSX.utils.aoa_to_sheet([EXCEL_HEADERS].concat(detail.map(rowToArray)));
-    applySheetLayout(pendingSheet, pending);
-    applySheetLayout(detailSheet, detail);
+    const pricePendingSheet = XLSX.utils.aoa_to_sheet([PRICE_HEADERS].concat(pricePending.map(priceRowToArray)));
+    const priceDetailSheet = XLSX.utils.aoa_to_sheet([PRICE_HEADERS].concat(priceRows.map(priceRowToArray)));
+    applySheetLayout(pendingSheet, pending, stockLayout);
+    applySheetLayout(detailSheet, detail, stockLayout);
+    applySheetLayout(pricePendingSheet, pricePending, priceLayout);
+    applySheetLayout(priceDetailSheet, priceRows, priceLayout);
     XLSX.utils.book_append_sheet(wb, pendingSheet, '待处理库存');
     XLSX.utils.book_append_sheet(wb, detailSheet, '库存检查结果明细');
+    XLSX.utils.book_append_sheet(wb, pricePendingSheet, '待处理价格');
+    XLSX.utils.book_append_sheet(wb, priceDetailSheet, '价格检查明细');
     return wb;
   }
 
@@ -772,6 +915,11 @@
     const byShop = groupRowsByShop(rows);
     const shops = Object.keys(byShop);
     const shopCount = shops.length;
+    const priceCounts = {};
+    rows.forEach((r) => {
+      if (!r.priceChange) return;
+      priceCounts[r.priceChange] = (priceCounts[r.priceChange] || 0) + 1;
+    });
     const lines = [
       '检查商品数：' + productCount,
       '店铺数：' + shopCount + '（按店铺分别下载）',
@@ -781,9 +929,13 @@
       '补充库存：' + (counts['补充库存'] || 0),
       '关联异常：' + (counts['关联异常'] || 0),
       '库存正常：' + (counts['库存正常'] || 0),
+      '涨价：' + (priceCounts['涨价'] || 0),
+      '降价：' + (priceCounts['降价'] || 0),
+      '换绑：' + (priceCounts['换绑'] || 0),
       '检查失败商品数：' + failCount,
       '耗时：' + formatDuration(elapsedMs),
     ];
+    if (priceCounts['首次']) lines.push('基准价已记下，下次检查才会对比涨跌');
     el.style.display = 'block';
     el.innerHTML = '<div class="sc-title">库存检查完成</div>'
       + lines.map((l) => '<div class="sc-line">' + escapeHtml(l) + '</div>').join('')

@@ -1,38 +1,4 @@
-# 1688-stock-checker
-
-## Purpose
-
-在 1688 轻应用容器内的爱用分销商品管理页注入「库存检查」，按规格匹配页 SKU 判定库存与关联结果，并对照本地货源价给出涨跌，导出四个 Sheet 的 Excel。
-
-## Requirements
-
-### Requirement: 注入范围与入口按钮
-
-脚本 MUST 仅在 1688 轻应用容器页（`light-app.1688.com` 的 `isv-container` / 爱用分销 `lapp_distribute_tool`、`goods_settings`）运行，包含以该地址为 `src` 的 iframe 文档。脚本 SHALL 在 `.relevance-box-header-new-line` 中「批量关联货源」主按钮之后插入「库存检查」按钮，外观与「批量关联货源」相同（`ant-btn ant-btn-primary`）。脚本 MUST NOT 修改「商品状态」等筛选（保持用户当前值，通常为「在售中」），MUST NOT 点击「重置」或改动推荐货源/自动换款开关。
-
-#### Scenario: 在商品管理页看到库存检查按钮
-
-- **WHEN** 用户打开爱用分销商品管理（关联货源）页且「批量关联货源」已渲染
-- **THEN** 该按钮右侧出现「库存检查」，样式与之同为主色按钮
-
-#### Scenario: 不改变商品状态筛选
-
-- **WHEN** 用户点击「库存检查」开始扫描
-- **THEN** 「商品状态」仍为点击前的选中值（如「在售中」）
-
-### Requirement: 全量扫描店铺与商品列表
-
-脚本 SHALL 扫描店铺下拉（`.nav-menu-select-shop` / `.select-shop-main-select`）中的全部店铺。对每个店铺，SHALL 按当前「商品状态」等筛选（不改筛选）检查商品列表中所有带「规格匹配」的商品，并在返回列表后翻商品列表分页直至没有下一页。规格匹配页没有分页，在该页 MUST NOT 点击 `ant-pagination`。
-
-#### Scenario: 扫完当前店全部列表页再切店
-
-- **WHEN** 用户点击「库存检查」且存在多个店铺、商品列表有多页
-- **THEN** 当前店每一页可检查商品均被核对，随后切换下一店铺重复，直到店铺列表结束
-
-#### Scenario: 店铺无规格匹配商品则跳过
-
-- **WHEN** 某店铺当前筛选下没有任何带「规格匹配」的商品
-- **THEN** 该店不写入失败，继续下一店铺
+## MODIFIED Requirements
 
 ### Requirement: 单商品规格匹配核对流程
 
@@ -177,6 +143,8 @@
 
 - **WHEN** 同一店铺商品有多条 SKU 行
 - **THEN** 该商品的店铺商品ID、店铺商品名、货源名称、货源供应商列在对应 Sheet 中合并为一组单元格
+
+## ADDED Requirements
 
 ### Requirement: 货源价本地存档与涨跌
 
