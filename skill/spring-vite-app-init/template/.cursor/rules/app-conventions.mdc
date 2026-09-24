@@ -1,0 +1,43 @@
+---
+alwaysApply: true
+---
+
+使用中文沟通与编写文档。OpenSpec 产物使用中文；归档前先把变更同步到主 specs。
+
+## 结构
+
+- `frontend/`：Vite + React + TypeScript + Tailwind，只放页面与交互。
+- `backend/`：JDK 21 + Spring Boot 3 + MyBatis-Plus + Druid + Flyway。
+- `openspec/`：需求与变更。
+- 发布只有一个 JAR。`mvn package` 在 `prepare-package` 执行前端 `build:static`，再把 `frontend/dist` 拷入 `classpath:/static`。
+- 开发时 Vite 把 `/api` 代理到 `http://127.0.0.1:__PORT__`。前端使用 Hash 路由。
+
+## API
+
+- 业务接口前缀 `/api/v1`。新增 Controller 必须使用 `ApiV1Paths.BASE` 拼接，禁止裸挂 `/api/xxx`。
+- 文档以 springdoc 为准（`/swagger-ui.html`、`/v3/api-docs`），不提交静态 openapi 文件。Try it out 基址随当前访问 Host。
+- 新增或变更接口必须补注解：Controller 用 `@Tag`、`@Operation`、`@ApiResponses`；参数用 `@Parameter`；DTO 用 `@Schema`。
+- 错误响应体为 `{ "message": "..." }`。
+
+## 数据库
+
+- 只使用 PostgreSQL。库名与 schema 均为 `__DB_NAME__`。连接信息来自环境变量 `DB_HOST`、`DB_PORT`、`DB_USERNAME`、`DB_PASSWORD`。
+- 表名 `t_` 开头。字段前缀：VARCHAR/CHAR/TEXT `c_`，INT/NUMERIC `n_`，DATE `d_`，TIMESTAMP `dt_`，JSON `j_`，字符串数组 `arr_c`，整数数组 `arr_n`。
+- 主键 `c_id`，VARCHAR(32)，由应用生成 UUID。其余字符串长度为 100 的整数倍。
+- 每张表包含 `c_created_user`、`dt_created_at`、`dt_updated_at`、`c_updated_user`。实体继承 `BaseEntity`。
+- 不建外键。表和字段都写中文 `COMMENT`。SQL 使用参数绑定，并为查询列建索引。
+- JSON 列统一用 `CommonJsonTypeHandler`。实体 `@TableName(..., autoResultMap = true)`，字段 `@TableField(typeHandler = CommonJsonTypeHandler.class)`。
+- 当前用户未接入时保留 `EmptyCurrentUserProvider`。接入登录时只替换这一处，不要注册第二个 `CurrentUserProvider`。
+
+## Flyway 与版本
+
+- 版本只改 `backend/pom.xml` 中 `<!-- app-version -->` 那一处，格式 `MAJOR.MINOR.PATCH` 或带 `-SNAPSHOT`。同时把 `frontend/package.json` 的 `version` 改成去掉 `-SNAPSHOT` 的数字。OpenAPI 版本由 Maven 过滤 `@project.version@`，不要手写。
+- 脚本目录 `db/migration/v{主版本两位}_{次版本两位}/`。文件名 `R__v{主版本两位}_{次版本两位}_{补丁三位}__{序号三位}__{英文名}.sql`。
+- 主版本、次版本各两位，从 `00` 起，保证 `v09` 排在 `v10` 之前。补丁与序号各三位。`0.1.0` 对应 `v00_01/R__v00_01_000__001__init.sql`。
+- 补丁升级：补丁段加一，序号从 `001` 重计，目录不变。次版本升级：新目录，补丁段 `000`，序号从 `001`。同一补丁内只递增序号。
+- 全部使用可重复脚本（`R__`），SQL 必须幂等：`CREATE TABLE IF NOT EXISTS`、`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`、种子数据 `ON CONFLICT`。已在共享环境执行过的排序键禁止改名。同一排序键只能有一个文件。
+- 不为 Flyway 脚本写单元测试。
+
+## 测试
+
+单元测试不启动 DataSource、Flyway、MyBatis，不使用 H2。Controller 用 `@WebMvcTest`。`@MapperScan` 放在独立配置类，不要写在启动类上。能 mock 的依赖就 mock。

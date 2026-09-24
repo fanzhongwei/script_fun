@@ -65,11 +65,11 @@ download_tarball() {
   mkdir -p "${CACHE_DIR}"
   local dest="${CACHE_DIR}/${TARBALL_NAME}"
   if [ -f "${dest}" ] && [ -s "${dest}" ]; then
-    echo "==> 使用缓存: ${dest}"
+    echo "==> 使用缓存: ${dest}" >&2
     echo "${dest}"
     return 0
   fi
-  echo "==> 下载独立 Python ${PY_VERSION} ..."
+  echo "==> 下载独立 Python ${PY_VERSION} ..." >&2
   local mirror="https://mirror.ghproxy.com/${TARBALL_URL}"
   if curl -fL --connect-timeout 20 --max-time 600 -o "${dest}.partial" "${TARBALL_URL}"; then
     mv "${dest}.partial" "${dest}"

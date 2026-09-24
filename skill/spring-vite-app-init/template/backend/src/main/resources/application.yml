@@ -1,0 +1,47 @@
+server:
+  port: __PORT__
+  forward-headers-strategy: framework
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+
+spring:
+  application:
+    name: __SLUG__
+  datasource:
+    type: com.alibaba.druid.pool.DruidDataSource
+    url: jdbc:postgresql://${DB_HOST:127.0.0.1}:${DB_PORT:5432}/__DB_NAME__?currentSchema=__DB_NAME__
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+    druid:
+      initial-size: 1
+      min-idle: 1
+      max-active: 8
+      max-wait: 30000
+      validation-query: SELECT 1
+      test-on-borrow: true
+      test-while-idle: true
+      test-on-return: false
+  flyway:
+    enabled: true
+    create-schemas: true
+    schemas: __DB_NAME__
+    default-schema: __DB_NAME__
+    table: t_flyway_schema_history
+    locations: classpath:db/migration
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: assign_uuid
+
+app:
+  version: @project.version@
