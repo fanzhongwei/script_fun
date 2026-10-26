@@ -1,0 +1,5 @@
+# 构建产物与运行时文件
+magnifier
+magnifier_test
+magnifier.lock
+*.tmp
