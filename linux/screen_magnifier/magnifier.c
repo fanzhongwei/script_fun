@@ -950,6 +950,42 @@ static int read_filter_zoom_file(App *app, double *out) {
     return 1;
 }
 
+static int read_size_key_file(App *app, unsigned int *mod) {
+    FILE *file;
+    char line[256];
+    int found = 0;
+    unsigned int value = 0;
+    file = fopen(app->conf_path, "r");
+    if (!file) {
+        return 0;
+    }
+    while (fgets(line, sizeof line, file)) {
+        char *text = trim(line);
+        char *eq;
+        char *key;
+        char *item;
+        if (!text[0] || text[0] == '#') {
+            continue;
+        }
+        eq = strchr(text, '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = '\0';
+        key = trim(text);
+        item = trim(eq + 1);
+        if (!strcmp(key, "size_key") && parse_size_key(item, &value)) {
+            found = 1;
+        }
+    }
+    fclose(file);
+    if (!found) {
+        return 0;
+    }
+    *mod = value;
+    return 1;
+}
+
 static int save_config(App *app) {
     char tmp[4200];
     char zoom_text[32];
@@ -970,34 +1006,42 @@ static int save_config(App *app) {
     }
     format_zoom_number(zoom_text, sizeof zoom_text, app->zoom);
     format_zoom_number(filter_text, sizeof filter_text, filter_value);
-    fputs("# 放大镜配置。以 # 开头的行是说明，程序不读取。\n"
-          "# 改完后重新启动才生效。滚轮调过的倍率、直径和阈值会写回下面的值，说明会保留。\n"
-          "#\n"
-          "# hotkey：建议绑到桌面快捷键上的组合。程序不抓取这个键。\n"
-          "#         可用 ctrl、alt、shift、super，用加号连接，例如 ctrl+alt+space。\n",
-          file);
-    fprintf(file, "hotkey=%s\n", app->hotkey);
-    fputs("#\n"
-          "# zoom：放大倍率，范围 1.25 到 6。没按住改大小的键、也没按住 Shift 时，滚轮改这项。\n",
-          file);
-    fprintf(file, "zoom=%s\n", zoom_text);
-    fputs("#\n"
-          "# diameter：圆的直径，单位像素。最小 96，最大不超过指针所在显示器较短的一边。\n",
-          file);
-    fprintf(file, "diameter=%d\n", app->pref_d);
-    fputs("#\n"
-          "# filter_zoom：算法阈值，范围 1.25 到 6.25。\n"
-          "#              当前倍率低于它时直接取最近的像素；不低于时横竖保持清晰，斜线才做过渡。\n"
-          "#              1.25 表示始终做边缘判断，6.25 表示始终直接取像素。\n"
-          "#              按住 Shift 滚轮改这项。若 size_key 是 shift，则 Shift 只改直径。\n",
-          file);
-    fprintf(file, "filter_zoom=%s\n", filter_text);
-    fputs("#\n"
-          "# size_key：按住这个键再滚轮，改变圆的直径。可选 alt、ctrl、shift、super，默认 alt。\n"
-          "#           选 ctrl 时，Ctrl+滚轮改直径，不再送给下面的窗口。\n"
-          "#           选别的键时，Ctrl+滚轮仍送给下面的窗口。\n",
-          file);
-    fprintf(file, "size_key=%s\n", app->size_key[0] ? app->size_key : size_key_token(app->size_mod));
+    {
+        unsigned int size_mod = app->size_mod;
+        if (!read_size_key_file(app, &size_mod)) {
+            size_mod = app->size_mod;
+        }
+        fputs("# 放大镜配置。以 # 开头的行是说明，程序不读取。\n"
+              "# size_key 保存后，下一次滚轮就按新键。filter_zoom 在下一次改倍率时生效。不必重启。\n"
+              "# 滚轮调过的倍率、直径和阈值会写回下面的值，说明会保留。\n"
+              "#\n"
+              "# hotkey：建议绑到桌面快捷键上的组合。程序不抓取这个键。\n"
+              "#         可用 ctrl、alt、shift、super，用加号连接，例如 ctrl+alt+space。\n",
+              file);
+        fprintf(file, "hotkey=%s\n", app->hotkey);
+        fputs("#\n"
+              "# zoom：放大倍率，范围 1.25 到 6。没按住改大小的键、也没按住 Shift 时，滚轮改这项。\n",
+              file);
+        fprintf(file, "zoom=%s\n", zoom_text);
+        fputs("#\n"
+              "# diameter：圆的直径，单位像素。最小 96，最大不超过指针所在显示器较短的一边。\n",
+              file);
+        fprintf(file, "diameter=%d\n", app->pref_d);
+        fputs("#\n"
+              "# filter_zoom：算法阈值，范围 1.25 到 6.25。\n"
+              "#              当前倍率低于它时直接取最近的像素；不低于时横竖保持清晰，斜线才做过渡。\n"
+              "#              1.25 表示始终做边缘判断，6.25 表示始终直接取像素。\n"
+              "#              size_key 不是 shift 时，按住 Shift 滚轮改这项。默认 size_key 是 shift，这时 Shift 只改直径。\n",
+              file);
+        fprintf(file, "filter_zoom=%s\n", filter_text);
+        fputs("#\n"
+              "# size_key：按住这个键再滚轮，改变圆的直径。可选 alt、ctrl、shift、super，默认 shift。\n"
+              "#           保存后下一次滚轮即生效，不必重启。\n"
+              "#           选 ctrl 时，Ctrl+滚轮改直径，不再送给下面的窗口。\n"
+              "#           选别的键时，Ctrl+滚轮仍送给下面的窗口。\n",
+              file);
+        fprintf(file, "size_key=%s\n", size_key_token(size_mod));
+    }
     if (fclose(file) != 0) {
         return 0;
     }
@@ -1011,8 +1055,8 @@ static int save_config(App *app) {
 
 static void set_default_config(App *app) {
     snprintf(app->hotkey, sizeof app->hotkey, "ctrl+alt+space");
-    snprintf(app->size_key, sizeof app->size_key, "alt");
-    app->size_mod = Mod1Mask;
+    snprintf(app->size_key, sizeof app->size_key, "shift");
+    app->size_mod = ShiftMask;
     app->zoom = 2.0;
     app->filter_zoom = 2.0;
     app->pref_d = DEFAULT_DIAMETER;
@@ -1103,7 +1147,7 @@ static int load_config(App *app) {
             unsigned int mod = 0;
             saw_size = 1;
             if (!parse_size_key(value, &mod)) {
-                app->size_mod = Mod1Mask;
+                app->size_mod = ShiftMask;
                 dirty = 1;
             } else {
                 app->size_mod = mod;
@@ -1129,7 +1173,7 @@ static int load_config(App *app) {
         dirty = 1;
     }
     if (!saw_size) {
-        app->size_mod = Mod1Mask;
+        app->size_mod = ShiftMask;
         dirty = 1;
     }
     snprintf(app->size_key, sizeof app->size_key, "%s", size_key_token(app->size_mod));
@@ -1960,6 +2004,7 @@ static void prepare_hint(App *app) {
                     alpha[(size_t)y * (size_t)w + (size_t)x] = (uint8_t)a;
                 }
             }
+            free(app->hint_alpha);
             app->hint_alpha = alpha;
             app->hint_w = w;
             app->hint_h = h;
@@ -1982,6 +2027,22 @@ static void prepare_hint(App *app) {
         XFreePixmap(app->dpy, pix);
     }
     XftFontClose(app->dpy, font);
+}
+
+static void reload_size_key(App *app) {
+    unsigned int mod = 0;
+    if (!read_size_key_file(app, &mod) || mod == app->size_mod) {
+        return;
+    }
+    app->size_mod = mod;
+    snprintf(app->size_key, sizeof app->size_key, "%s", size_key_token(mod));
+    if (app->wheel_grabbed && !app->pointer_grabbed) {
+        ungrab_wheel(app);
+        grab_wheel(app);
+    }
+    if (app->dpy && app->win) {
+        prepare_hint(app);
+    }
 }
 
 static uint32_t pack_pixel(App *app, int r, int g, int b, int a) {
@@ -2377,6 +2438,7 @@ static int wheel_action(App *app, unsigned int state) {
     int y = 0;
     unsigned int live = 0;
     unsigned int mods = state;
+    reload_size_key(app);
     if (query_pointer(app, &x, &y, &live)) {
         mods |= live;
     }
@@ -2499,6 +2561,7 @@ static void tick(App *app) {
     if (!app->mapped) {
         return;
     }
+    reload_size_key(app);
     if (!query_pointer(app, &px, &py, &mask)) {
         return;
     }
